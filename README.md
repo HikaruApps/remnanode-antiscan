@@ -1,4 +1,4 @@
-# 🛡 remnanode-antiscan
+# 🛡 ufw-antiscan
 
 Защита от сканеров, флуда и брутфорса поверх существующего UFW.
 
@@ -24,6 +24,16 @@
 - **ICMP rate-limit** — ping живой, флуд режется
 - **Whitelist** — IP из списка всегда пропускаются первыми
 
+### 🗂 Blocklists (ipset)
+
+Блокировка **известных** сканеров и государственных сетей по готовым публичным спискам.
+
+- Загружает списки в **ipset** (hash:net) — O(1) lookup, десятки тысяч подсетей без потери скорости
+- Источники: [shadow-netlab/traffic-guard-lists](https://github.com/shadow-netlab/traffic-guard-lists) — antiscanner + government_networks
+- **Атомарное обновление** через `ipset swap` — нет разрыва защиты во время обновления
+- Systemd-таймер автоматически обновляет списки каждые 6 часов
+- Работает как первый слой: попадает ещё до ipt_recent, CrowdSec и rate-limit
+
 ### 🚫 fail2ban
 
 SSH brute-force: бан после 5 попыток за 5 минут, на 24 часа.
@@ -42,7 +52,7 @@ Community-driven threat intelligence: IP, уже атакующие других
 
 ```bash
 # Скачать
-git clone https://github.com/HikaruApps/ufw-antiscan.git
+git clone https://github.com/<твой-ник>/ufw-antiscan.git
 cd ufw-antiscan
 
 # Интерактивное меню
@@ -84,6 +94,9 @@ sudo ENABLE_CROWDSEC=0 bash install.sh protect
 | `PORTSCAN_BAN_SECONDS`  | `3600`       | Время бана за сканирование (секунд) |
 | `ENABLE_PORTSCAN_BAN`   | `1`          | Включить AntiScan |
 | `ENABLE_CROWDSEC`       | `1`          | Установить CrowdSec |
+| `ENABLE_BLOCKLISTS`     | `1`          | Загрузить IP-blocklists в ipset |
+| `BLOCKLIST_URLS`        | antiscanner + gov_networks | URL списков через пробел |
+| `BLOCKLIST_UPDATE_INTERVAL` | `6h`     | Интервал авто-обновления (systemd) |
 | `CROWDSEC_ENROLL_KEY`   | —            | Ключ из [app.crowdsec.net](https://app.crowdsec.net) |
 | `DRY_RUN`               | `0`          | `1` — показать правила без применения |
 | `PURGE_CROWDSEC`        | `0`          | `1` — удалить CrowdSec при откате |
@@ -112,6 +125,15 @@ sudo bash install.sh --help
 ```bash
 # Статус одной командой
 sudo bash install.sh status
+
+# Blocklist статистика
+ipset list ANTISCAN-V4 | tail -3    # кол-во загруженных подсетей
+
+# Обновить blocklists вручную
+systemctl start ufw-antiscan-blocklists
+
+# Логи обновления
+journalctl -u ufw-antiscan-blocklists -f
 
 # Portscan-баны (ipt_recent)
 cat /proc/net/ipt_recent/PORTSCANNERS
@@ -160,6 +182,18 @@ cscli decisions delete --ip 1.2.3.4
 ## Как это работает
 
 UFW — фронтенд к iptables. Все правила вставляются в `/etc/ufw/before.rules` в цепочку `ufw-before-input`, которая обрабатывается **до** пользовательских правил UFW.
+
+Полная цепочка обработки пакета:
+```
+входящий пакет
+  → ipset blocklists       (O(1), известные сканеры/gov — DROP)
+  → flag-drop              (XMAS, NULL, SYN+FIN — DROP)
+  → anti-spoofing          (RFC1918 на WAN — DROP)
+  → ipt_recent antiscan    (SYN на закрытый порт → autoban)
+  → hashlimit / connlimit  (SYN-flood, per-IP лимиты)
+  → CrowdSec bouncer       (community decisions)
+  → UFW ACCEPT             (легитимный трафик)
+```
 
 При `ufw reload` файл перечитывается, правила сохраняются. Docker-NAT и CrowdSec-bouncer работают в своих отдельных цепочках и не затрагиваются.
 
