@@ -52,8 +52,8 @@ Community-driven threat intelligence: IP, уже атакующие других
 
 ```bash
 # Скачать
-git clone https://github.com/<твой-ник>/ufw-antiscan.git
-cd ufw-antiscan
+git clone https://github.com/HikaruApps/remnanode-antiscan.git
+cd remnanode-antiscan
 
 # Интерактивное меню
 sudo bash install.sh
