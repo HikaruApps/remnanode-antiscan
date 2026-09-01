@@ -189,6 +189,8 @@ build_rules() {
     echo ""
 
     # Whitelist должен идти раньше всех DROP-правил, включая blocklists.
+    # RETURN выводит пакет из ufw-before-input обратно в основную UFW-цепочку,
+    # не обходя пользовательские ALLOW/DENY-правила.
     if [[ -n "$WHITELIST" ]]; then
         echo "# ── Whitelist ──────────────────────────────────────────────────────"
         IFS=',' read -ra WL <<< "$WHITELIST"
@@ -197,7 +199,7 @@ build_rules() {
             [[ -z "$ip" ]] && continue
             if [[ "$FAMILY" == "4" && "$ip" == *:* ]]; then continue; fi
             if [[ "$FAMILY" == "6" && "$ip" != *:* ]]; then continue; fi
-            echo "-A ${CHAIN} -s ${ip} -j ACCEPT"
+            echo "-A ${CHAIN} -s ${ip} -j RETURN"
         done
         echo ""
     fi
@@ -275,21 +277,20 @@ build_rules() {
     echo "# ── SSH per-IP rate-limit ───────────────────────────────────────────"
     echo "-A ${CHAIN} -p tcp --dport ${SSH_PORT} --syn -m hashlimit --hashlimit-above ${SSH_RATE}/minute --hashlimit-burst ${SSH_BURST} --hashlimit-mode srcip --hashlimit-name ssh_rate --hashlimit-htable-expire 60000 -j DROP"
 
-    # AntiScan: снятие флага для сервисных портов и бан нессервисных
-    # Стоит ПОСЛЕ rate-limit — легитимный трафик всё равно проходит через лимиты
+    # AntiScan: сервисные порты возвращаем в обычную обработку UFW.
+    # Важно: --remove без target не завершает цепочку и раньше пропускал даже
+    # разрешённые SYN до общего DROP ниже.
     if [[ "$ENABLE_PORTSCAN_BAN" == "1" ]]; then
         echo ""
-        echo "# ── AntiScan: сервисные порты — снять флаг сканера, идти дальше ────"
-        echo "# Используем --remove без -j RETURN, чтобы трафик продолжал"
-        echo "# обрабатываться UFW-правилами (ACCEPT и т.д.)"
-        echo "-A ${CHAIN} -p tcp --dport ${SSH_PORT} -m recent --name PORTSCANNERS --remove"
+        echo "# ── AntiScan: сервисные порты → обратно в обычные правила UFW ─────"
+        echo "-A ${CHAIN} -p tcp --dport ${SSH_PORT} -j RETURN"
         IFS=',' read -ra TPORTS <<< "$TCP_PORTS"
         for p in "${TPORTS[@]}"; do
-            echo "-A ${CHAIN} -p tcp --dport ${p// /} -m recent --name PORTSCANNERS --remove"
+            echo "-A ${CHAIN} -p tcp --dport ${p// /} -j RETURN"
         done
         IFS=',' read -ra UPORTS <<< "$UDP_PORTS"
         for p in "${UPORTS[@]}"; do
-            echo "-A ${CHAIN} -p udp --dport ${p// /} -m recent --name PORTSCANNERS --remove"
+            echo "-A ${CHAIN} -p udp --dport ${p// /} -j RETURN"
         done
         echo ""
         echo "# SYN/UDP на нессервисный порт → в список сканеров + DROP"
