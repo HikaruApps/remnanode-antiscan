@@ -104,6 +104,7 @@ BLOCKLIST_UPDATE_INTERVAL="${BLOCKLIST_UPDATE_INTERVAL:-6h}"
 IPSET_NAME_V4="ANTISCAN-V4"
 IPSET_NAME_V6="ANTISCAN-V6"
 BLOCKLIST_UPDATE_SCRIPT="/usr/local/bin/ufw-antiscan-update-blocklists.sh"
+IPSET_BOOTSTRAP_SCRIPT="/usr/local/bin/ufw-antiscan-ensure-ipsets.sh"
 
 MARKER_START="# === UFW-ANTISCAN START ==="
 MARKER_END="# === UFW-ANTISCAN END ==="
@@ -116,6 +117,7 @@ section "Проверка окружения"
 [[ $EUID -ne 0 ]] && err "Нужен root: sudo bash $0"
 command -v ufw      &>/dev/null || err "ufw не установлен. Установи: apt install ufw"
 command -v iptables &>/dev/null || err "iptables не найден"
+command -v iptables-restore &>/dev/null || err "iptables-restore не найден"
 command -v python3  &>/dev/null || err "python3 не найден. Установи: apt install python3"
 
 # Проверка поддерживаемой ОС
@@ -186,19 +188,7 @@ build_rules() {
     echo "# Установлено ufw-antiscan $(date)"
     echo ""
 
-    # ipset blocklists (самый первый слой — O(1), не трогаем banned-scanners)
-    if [[ "$ENABLE_BLOCKLISTS" == "1" ]]; then
-        echo "# ── ipset blocklists (known scanners/gov networks) ──────────────────"
-        echo "# ipset-сеты создаются отдельно; здесь только jump-правила"
-        if [[ "$FAMILY" == "4" ]]; then
-            echo "-A ${CHAIN} -m set --match-set ${IPSET_NAME_V4} src -j DROP"
-        else
-            echo "-A ${CHAIN} -m set --match-set ${IPSET_NAME_V6} src -j DROP"
-        fi
-        echo ""
-    fi
-
-    # Whitelist
+    # Whitelist должен идти раньше всех DROP-правил, включая blocklists.
     if [[ -n "$WHITELIST" ]]; then
         echo "# ── Whitelist ──────────────────────────────────────────────────────"
         IFS=',' read -ra WL <<< "$WHITELIST"
@@ -212,15 +202,32 @@ build_rules() {
         echo ""
     fi
 
+    # ipset blocklists (O(1), после whitelist)
+    if [[ "$ENABLE_BLOCKLISTS" == "1" ]]; then
+        echo "# ── ipset blocklists (known scanners/gov networks) ──────────────────"
+        echo "# ipset-сеты создаются отдельно; здесь только jump-правила"
+        if [[ "$FAMILY" == "4" ]]; then
+            echo "-A ${CHAIN} -m set --match-set ${IPSET_NAME_V4} src -j DROP"
+        else
+            echo "-A ${CHAIN} -m set --match-set ${IPSET_NAME_V6} src -j DROP"
+        fi
+        echo ""
+    fi
+
     echo "# ── Bad TCP flags (flag-drop) ──────────────────────────────────────"
-    echo "-A ${CHAIN} -p tcp --tcp-flags ALL ALL         -j DROP  # XMAS"
-    echo "-A ${CHAIN} -p tcp --tcp-flags ALL NONE        -j DROP  # NULL"
+    echo "# XMAS"
+    echo "-A ${CHAIN} -p tcp --tcp-flags ALL ALL -j DROP"
+    echo "# NULL"
+    echo "-A ${CHAIN} -p tcp --tcp-flags ALL NONE -j DROP"
     echo "-A ${CHAIN} -p tcp --tcp-flags SYN,FIN SYN,FIN -j DROP"
     echo "-A ${CHAIN} -p tcp --tcp-flags SYN,RST SYN,RST -j DROP"
     echo "-A ${CHAIN} -p tcp --tcp-flags FIN,RST FIN,RST -j DROP"
-    echo "-A ${CHAIN} -p tcp --tcp-flags ACK,FIN FIN     -j DROP  # FIN без ACK"
-    echo "-A ${CHAIN} -p tcp --tcp-flags ACK,PSH PSH     -j DROP  # PSH без ACK"
-    echo "-A ${CHAIN} -p tcp --tcp-flags ACK,URG URG     -j DROP  # URG без ACK"
+    echo "# FIN без ACK"
+    echo "-A ${CHAIN} -p tcp --tcp-flags ACK,FIN FIN -j DROP"
+    echo "# PSH без ACK"
+    echo "-A ${CHAIN} -p tcp --tcp-flags ACK,PSH PSH -j DROP"
+    echo "# URG без ACK"
+    echo "-A ${CHAIN} -p tcp --tcp-flags ACK,URG URG -j DROP"
     echo ""
 
     # Anti-spoofing только IPv4
@@ -249,10 +256,7 @@ build_rules() {
     IFS=',' read -ra TPORTS <<< "$TCP_PORTS"
     for p in "${TPORTS[@]}"; do
         p="${p// /}"
-        echo "-A ${CHAIN} -p tcp --dport ${p} --syn \\"
-        echo "   -m hashlimit --hashlimit-above ${SYN_RATE}/sec --hashlimit-burst ${SYN_BURST} \\"
-        echo "   --hashlimit-mode srcip --hashlimit-name syn_${p} \\"
-        echo "   --hashlimit-htable-expire 10000 -j DROP"
+        echo "-A ${CHAIN} -p tcp --dport ${p} --syn -m hashlimit --hashlimit-above ${SYN_RATE}/sec --hashlimit-burst ${SYN_BURST} --hashlimit-mode srcip --hashlimit-name syn_${p} --hashlimit-htable-expire 10000 -j DROP"
     done
     echo ""
 
@@ -260,16 +264,16 @@ build_rules() {
     IFS=',' read -ra TPORTS <<< "$TCP_PORTS"
     for p in "${TPORTS[@]}"; do
         p="${p// /}"
-        echo "-A ${CHAIN} -p tcp --dport ${p} \\"
-        echo "   -m connlimit --connlimit-above ${CONN_LIMIT} --connlimit-mask 32 -j DROP"
+        if [[ "$FAMILY" == "4" ]]; then
+            echo "-A ${CHAIN} -p tcp --dport ${p} -m connlimit --connlimit-above ${CONN_LIMIT} --connlimit-mask 32 -j DROP"
+        else
+            echo "-A ${CHAIN} -p tcp --dport ${p} -m connlimit --connlimit-above ${CONN_LIMIT} --connlimit-mask 128 -j DROP"
+        fi
     done
     echo ""
 
     echo "# ── SSH per-IP rate-limit ───────────────────────────────────────────"
-    echo "-A ${CHAIN} -p tcp --dport ${SSH_PORT} --syn \\"
-    echo "   -m hashlimit --hashlimit-above ${SSH_RATE}/minute --hashlimit-burst ${SSH_BURST} \\"
-    echo "   --hashlimit-mode srcip --hashlimit-name ssh_rate \\"
-    echo "   --hashlimit-htable-expire 60000 -j DROP"
+    echo "-A ${CHAIN} -p tcp --dport ${SSH_PORT} --syn -m hashlimit --hashlimit-above ${SSH_RATE}/minute --hashlimit-burst ${SSH_BURST} --hashlimit-mode srcip --hashlimit-name ssh_rate --hashlimit-htable-expire 60000 -j DROP"
 
     # AntiScan: снятие флага для сервисных портов и бан нессервисных
     # Стоит ПОСЛЕ rate-limit — легитимный трафик всё равно проходит через лимиты
@@ -296,13 +300,9 @@ build_rules() {
 
     echo "# ── ICMP rate-limit ─────────────────────────────────────────────────"
     if [[ "$FAMILY" == "4" ]]; then
-        echo "-A ${CHAIN} -p icmp --icmp-type echo-request \\"
-        echo "   -m hashlimit --hashlimit-above 5/sec --hashlimit-burst 10 \\"
-        echo "   --hashlimit-mode srcip --hashlimit-name icmp_rate -j DROP"
+        echo "-A ${CHAIN} -p icmp --icmp-type echo-request -m hashlimit --hashlimit-above 5/sec --hashlimit-burst 10 --hashlimit-mode srcip --hashlimit-name icmp_rate -j DROP"
     else
-        echo "-A ${CHAIN} -p ipv6-icmp --icmpv6-type echo-request \\"
-        echo "   -m hashlimit --hashlimit-above 5/sec --hashlimit-burst 10 \\"
-        echo "   --hashlimit-mode srcip --hashlimit-name icmp6_rate -j DROP"
+        echo "-A ${CHAIN} -p ipv6-icmp --icmpv6-type echo-request -m hashlimit --hashlimit-above 5/sec --hashlimit-burst 10 --hashlimit-mode srcip --hashlimit-name icmp6_rate -j DROP"
     fi
 
     echo ""
@@ -454,6 +454,45 @@ UPDSCRIPT
 
     chmod +x "${BLOCKLIST_UPDATE_SCRIPT}"
 
+    # ipset-наборы не переживают перезагрузку. Создаём их до запуска UFW,
+    # иначе iptables-restore не сможет загрузить before.rules при старте ОС.
+    cat > "${IPSET_BOOTSTRAP_SCRIPT}" << 'BOOTSTRAP'
+#!/bin/sh
+set -eu
+
+ipset create ANTISCAN-V4 hash:net family inet  hashsize 65536 maxelem 500000 2>/dev/null || true
+ipset create ANTISCAN-V6 hash:net family inet6 hashsize 65536 maxelem 500000 2>/dev/null || true
+BOOTSTRAP
+    chmod +x "${IPSET_BOOTSTRAP_SCRIPT}"
+
+    cat > /etc/systemd/system/ufw-antiscan-ipsets.service << BOOTEOF
+[Unit]
+Description=ufw-antiscan: создать ipset-наборы до запуска UFW
+DefaultDependencies=no
+After=local-fs.target
+Before=ufw.service
+
+[Service]
+Type=oneshot
+ExecStart=${IPSET_BOOTSTRAP_SCRIPT}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+BOOTEOF
+
+    mkdir -p /etc/systemd/system/ufw.service.d
+    cat > /etc/systemd/system/ufw.service.d/ufw-antiscan-ipsets.conf << 'DROPINEOF'
+[Unit]
+Requires=ufw-antiscan-ipsets.service
+After=ufw-antiscan-ipsets.service
+DROPINEOF
+
+    systemctl daemon-reload
+    systemctl enable ufw-antiscan-ipsets.service 2>/dev/null
+    systemctl restart ufw-antiscan-ipsets.service
+    ok "ipset bootstrap настроен до запуска UFW"
+
     # Сохраняем URLs в конфиг
     mkdir -p /etc/ufw-antiscan
     : > /etc/ufw-antiscan/blocklists.conf
@@ -499,8 +538,8 @@ TMREOF
     ok "Systemd-таймер: обновление каждые ${BLOCKLIST_UPDATE_INTERVAL}"
 
     # Статистика
-    V4_COUNT=$(ipset list "${IPSET_NAME_V4}" 2>/dev/null | grep -c "^[0-9]" || echo 0)
-    V6_COUNT=$(ipset list "${IPSET_NAME_V6}" 2>/dev/null | grep -c "^[0-9:]" || echo 0)
+    V4_COUNT=$(ipset list "${IPSET_NAME_V4}" 2>/dev/null | awk '/^Number of entries:/ {print $4; found=1} END {if (!found) print 0}')
+    V6_COUNT=$(ipset list "${IPSET_NAME_V6}" 2>/dev/null | awk '/^Number of entries:/ {print $4; found=1} END {if (!found) print 0}')
     ok "Загружено: IPv4=${V4_COUNT} подсетей, IPv6=${V6_COUNT} подсетей"
 }
 
@@ -540,9 +579,17 @@ if [[ "$ENABLE_CROWDSEC" == "1" ]]; then
     section "CrowdSec"
 
     if ! command -v cscli &>/dev/null; then
+        if ! command -v gpg &>/dev/null; then
+            info "Устанавливаю gnupg для импорта ключа репозитория CrowdSec..."
+            apt-get update -q
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q gnupg
+            ok "gnupg установлен"
+        fi
+
         info "Добавляю репозиторий CrowdSec..."
         curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey \
-            | gpg --dearmor -o /usr/share/keyrings/crowdsec-archive-keyring.gpg
+            | gpg --batch --yes --dearmor \
+                -o /usr/share/keyrings/crowdsec-archive-keyring.gpg
 
         . /etc/os-release
         echo "deb [signed-by=/usr/share/keyrings/crowdsec-archive-keyring.gpg] \
@@ -593,9 +640,45 @@ https://packagecloud.io/crowdsec/crowdsec/${ID} ${VERSION_CODENAME} main" \
     ok "CrowdSec запущен"
 fi
 
+# ── Проверка сгенерированных UFW-файлов ──────────────────────────────────────
+validate_ufw_rules() {
+    local failed=0
+
+    info "Проверяю синтаксис /etc/ufw/before.rules..."
+    if ! iptables-restore --test < /etc/ufw/before.rules; then
+        warn "Ошибка синтаксиса IPv4 ruleset"
+        failed=1
+    fi
+
+    if [[ -f /etc/ufw/before6.rules ]]; then
+        if ! command -v ip6tables-restore &>/dev/null; then
+            warn "ip6tables-restore не найден, IPv6 ruleset проверить невозможно"
+            failed=1
+        else
+            info "Проверяю синтаксис /etc/ufw/before6.rules..."
+            if ! ip6tables-restore --test < /etc/ufw/before6.rules; then
+                warn "Ошибка синтаксиса IPv6 ruleset"
+                failed=1
+            fi
+        fi
+    fi
+
+    if [[ "$failed" != "0" ]]; then
+        warn "Возвращаю исходные UFW-файлы из бэкапа"
+        cp "$BACKUP_DIR/before.rules.bak" /etc/ufw/before.rules
+        if [[ -f "$BACKUP_DIR/before6.rules.bak" ]]; then
+            cp "$BACKUP_DIR/before6.rules.bak" /etc/ufw/before6.rules
+        fi
+        err "Правила не применены. Исходные UFW-файлы восстановлены: $BACKUP_DIR"
+    fi
+
+    ok "Синтаксис IPv4/IPv6 правил корректен"
+}
+
 # ── Применяем всё ─────────────────────────────────────────────────────────────
 section "Применение"
 
+validate_ufw_rules
 systemctl enable --now fail2ban 2>/dev/null || true
 systemctl restart fail2ban
 ufw reload
@@ -621,8 +704,8 @@ fail2ban-client status sshd 2>/dev/null || true
 if [[ "$ENABLE_BLOCKLISTS" == "1" ]]; then
     echo ""
     echo -e "${BOLD}Blocklists (ipset):${NC}"
-    V4_COUNT=$(ipset list "${IPSET_NAME_V4}" 2>/dev/null | grep -c "^[0-9]" || echo 0)
-    V6_COUNT=$(ipset list "${IPSET_NAME_V6}" 2>/dev/null | grep -c "^[0-9:]" || echo 0)
+    V4_COUNT=$(ipset list "${IPSET_NAME_V4}" 2>/dev/null | awk '/^Number of entries:/ {print $4; found=1} END {if (!found) print 0}')
+    V6_COUNT=$(ipset list "${IPSET_NAME_V6}" 2>/dev/null | awk '/^Number of entries:/ {print $4; found=1} END {if (!found) print 0}')
     echo "  Загружено подсетей: IPv4=${V4_COUNT}, IPv6=${V6_COUNT}"
     NEXT=$(systemctl status ufw-antiscan-blocklists.timer 2>/dev/null | awk '/Trigger:/{print $2,$3}' || echo 'нет таймера')
     echo "  Следующее обновление: ${NEXT}"
