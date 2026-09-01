@@ -52,7 +52,7 @@ Community-driven threat intelligence: IP, уже атакующие других
 
 ```bash
 # Скачать
-git clone https://github.com/HikaruApps/ufw-antiscan.git
+git clone https://github.com/HikaruApps/remnanode-antiscan.git
 cd ufw-antiscan
 
 # Интерактивное меню
