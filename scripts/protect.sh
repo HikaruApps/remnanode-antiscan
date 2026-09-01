@@ -694,7 +694,21 @@ ufw status numbered 2>/dev/null | head -20
 
 echo ""
 echo -e "${BOLD}Portscan-баны:${NC}"
-SCAN_COUNT=$(wc -l < /proc/net/ipt_recent/PORTSCANNERS 2>/dev/null || echo 0)
+RECENT_FILE=""
+for candidate in \
+    /proc/net/xt_recent/PORTSCANNERS \
+    /proc/net/ipt_recent/PORTSCANNERS; do
+    if [[ -r "$candidate" ]]; then
+        RECENT_FILE="$candidate"
+        break
+    fi
+done
+
+if [[ -n "$RECENT_FILE" ]]; then
+    SCAN_COUNT=$(wc -l < "$RECENT_FILE")
+else
+    SCAN_COUNT=0
+fi
 echo "  Заблокировано IP: ${SCAN_COUNT}"
 
 echo ""
@@ -724,8 +738,9 @@ echo ""
 echo -e "${BOLD}Полезные команды:${NC}"
 echo "  Статус:                   sudo bash install.sh status"
 echo "  Откат:                    sudo bash install.sh rollback"
-echo "  Portscan-баны:            cat /proc/net/ipt_recent/PORTSCANNERS"
-echo "  Разбанить всех сканеров:  echo / > /proc/net/ipt_recent/PORTSCANNERS"
+RECENT_FILE_DISPLAY="${RECENT_FILE:-/proc/net/xt_recent/PORTSCANNERS}"
+echo "  Portscan-баны:            cat ${RECENT_FILE_DISPLAY}"
+echo "  Разбанить всех сканеров:  echo / > ${RECENT_FILE_DISPLAY}"
 echo "  SSH-баны:                 fail2ban-client status sshd"
 echo "  CrowdSec-баны:            cscli decisions list"
 echo "  Blocklist-статистика:     ipset list ANTISCAN-V4 | tail -3"
