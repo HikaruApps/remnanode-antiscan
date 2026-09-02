@@ -165,9 +165,11 @@ sudo PURGE_CROWDSEC=1 bash install.sh rollback
 
 ```bash
 # Конкретный IP из portscan-банов
+echo -1.2.3.4 > /proc/net/xt_recent/PORTSCANNERS 2>/dev/null || \
 echo -1.2.3.4 > /proc/net/ipt_recent/PORTSCANNERS
 
 # Всех сканеров сразу
+echo / > /proc/net/xt_recent/PORTSCANNERS 2>/dev/null || \
 echo / > /proc/net/ipt_recent/PORTSCANNERS
 
 # SSH (fail2ban)
