@@ -93,6 +93,9 @@ ENABLE_PORTSCAN_BAN="${ENABLE_PORTSCAN_BAN:-1}"
 
 WHITELIST="${WHITELIST:-}"
 
+# Safety timer: автоматический откат если что-то пошло не так (секунд)
+SAFETY_TIMER="${SAFETY_TIMER:-60}"
+
 ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-1}"
 CROWDSEC_ENROLL_KEY="${CROWDSEC_ENROLL_KEY:-}"
 
@@ -145,8 +148,18 @@ UFW_STATUS=$(ufw status 2>/dev/null | head -1 || true)
     warn "UFW сейчас неактивен — правила применятся после: sudo ufw enable"
 
 WAN_IFACE=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1 || true)
-[[ -z "$WAN_IFACE" ]] && \
-    warn "WAN-интерфейс не определён — anti-spoofing без привязки к интерфейсу"
+[[ -z "$WAN_IFACE" ]] &&     warn "WAN-интерфейс не определён — anti-spoofing без привязки к интерфейсу"
+
+# Авто-детект: если у сервера приватный IP (VPS за NAT) — anti-spoofing опасен
+MY_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1 || true)
+ENABLE_ANTISPOOFING="${ENABLE_ANTISPOOFING:-1}"
+if [[ "${ENABLE_ANTISPOOFING}" == "1" && -n "$MY_IP" ]]; then
+    if [[ "$MY_IP" =~ ^10\. ||           "$MY_IP" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ||           "$MY_IP" =~ ^192\.168\. ||           "$MY_IP" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]; then
+        warn "Обнаружен приватный IP сервера (${MY_IP}) — anti-spoofing ОТКЛЮЧЁН"
+        warn "Сервер за NAT: RFC1918-правила заблокируют легитимный трафик"
+        ENABLE_ANTISPOOFING=0
+    fi
+fi
 
 # Проверка что hashlimit и recent доступны
 if ! iptables -m hashlimit --help &>/dev/null 2>&1; then
@@ -162,6 +175,7 @@ info "WAN:       ${WAN_IFACE:-любой интерфейс}"
 info "TCP-порты: ${TCP_PORTS}"
 info "UDP-порты: ${UDP_PORTS}"
 info "Whitelist: ${WHITELIST:-не задан}"
+info "Anti-spoof: ${ENABLE_ANTISPOOFING} (IP сервера: ${MY_IP:-неизвестен})"
 info "CrowdSec:  ${ENABLE_CROWDSEC}"
 info "Blocklists: ${ENABLE_BLOCKLISTS}"
 info "DRY RUN:   ${DRY_RUN}"
@@ -232,8 +246,8 @@ build_rules() {
     echo "-A ${CHAIN} -p tcp --tcp-flags ACK,URG URG -j DROP"
     echo ""
 
-    # Anti-spoofing только IPv4
-    if [[ "$FAMILY" == "4" ]]; then
+    # Anti-spoofing только IPv4 и только если сервер имеет публичный IP
+    if [[ "$FAMILY" == "4" && "$ENABLE_ANTISPOOFING" == "1" ]]; then
         local SIFACE=""
         [[ -n "$WAN_IFACE" ]] && SIFACE="-i ${WAN_IFACE}"
         echo "# ── Anti-spoofing (RFC1918/bogon на WAN) ───────────────────────────"
@@ -680,9 +694,41 @@ validate_ufw_rules() {
 section "Применение"
 
 validate_ufw_rules
+
+# Safety timer: если через SAFETY_TIMER секунд скрипт ещё не завершился нормально,
+# автоматически восстанавливаем бэкап. Защита от потери SSH-доступа.
+SAFETY_PID=""
+if [[ "$SAFETY_TIMER" -gt 0 ]]; then
+    (
+        sleep "$SAFETY_TIMER"
+        echo ""
+        echo -e "\033[0;31m[!] SAFETY ROLLBACK: $SAFETY_TIMER сек прошло, что-то пошло не так!\033[0m"
+        echo -e "\033[0;31m[!] Восстанавливаю исходные правила из бэкапа...\033[0m"
+        cp "$BACKUP_DIR/before.rules.bak" /etc/ufw/before.rules 2>/dev/null || true
+        [[ -f "$BACKUP_DIR/before6.rules.bak" ]] &&             cp "$BACKUP_DIR/before6.rules.bak" /etc/ufw/before6.rules 2>/dev/null || true
+        ufw reload 2>/dev/null || true
+        echo -e "\033[0;32m[✔] Исходные правила восстановлены\033[0m"
+    ) &
+    SAFETY_PID=$!
+    info "Safety timer запущен (PID ${SAFETY_PID}): автооткат через ${SAFETY_TIMER} сек"
+fi
+
 systemctl enable --now fail2ban 2>/dev/null || true
 systemctl restart fail2ban
 ufw reload
+
+# Проверяем что SSH-порт слушает после применения
+sleep 2
+if ss -tlnp 2>/dev/null | grep -q ":${SSH_PORT} "; then
+    ok "SSH (порт ${SSH_PORT}) слушает — соединение не потеряно"
+else
+    warn "SSH-порт ${SSH_PORT} не обнаружен после reload!"
+fi
+
+# Отменяем safety timer — всё ок
+if [[ -n "$SAFETY_PID" ]]; then
+    kill "$SAFETY_PID" 2>/dev/null &&         ok "Safety timer отменён — правила применены успешно" || true
+fi
 
 ok "UFW перезагружен, fail2ban запущен"
 
