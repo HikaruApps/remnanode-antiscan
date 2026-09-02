@@ -127,7 +127,7 @@ sudo bash install.sh --help
 sudo bash install.sh status
 
 # Blocklist статистика
-ipset list ANTISCAN-V4 | tail -3    # кол-во загруженных подсетей
+ipset list ANTISCAN-V4 | grep "Number of entries"
 
 # Обновить blocklists вручную
 systemctl start ufw-antiscan-blocklists
@@ -136,7 +136,7 @@ systemctl start ufw-antiscan-blocklists
 journalctl -u ufw-antiscan-blocklists -f
 
 # Portscan-баны (ipt_recent)
-cat /proc/net/ipt_recent/PORTSCANNERS
+cat /proc/net/xt_recent/PORTSCANNERS 2>/dev/null || cat /proc/net/ipt_recent/PORTSCANNERS
 
 # SSH-баны (fail2ban)
 fail2ban-client status sshd
