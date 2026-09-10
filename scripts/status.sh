@@ -3,6 +3,7 @@
 # Read-only отчёт о состоянии защиты
 
 set -euo pipefail
+export LC_ALL=C
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -18,16 +19,28 @@ echo -e "$(date)"
 
 # ── UFW ───────────────────────────────────────────────────────────────────────
 section "UFW"
+if [[ -f /var/lib/ufw-antiscan/pending ]]; then
+    warn "Применение не подтверждено; ожидается автоматический откат"
+fi
 
 UFW_STATUS=$(ufw status 2>/dev/null | head -1 || true)
-if [[ "$UFW_STATUS" == *"active"* ]]; then
+if [[ "$UFW_STATUS" == "Status: active" ]]; then
     ok "UFW активен"
 else
     bad "UFW неактивен! Включи: sudo ufw enable"
 fi
 
 if grep -q "UFW-ANTISCAN START" /etc/ufw/before.rules 2>/dev/null; then
-    ok "Правила ufw-antiscan установлены (before.rules)"
+    ok "Правила ufw-antiscan записаны (before.rules)"
+    if iptables -S ufw-antiscan >/dev/null 2>&1; then
+        if iptables -C ufw-before-input -j ufw-antiscan >/dev/null 2>&1; then
+            ok "Цепочка IPv4 подключена"
+        else
+            bad "Цепочка IPv4 есть, но переход к ней отсутствует"
+        fi
+    else
+        bad "Цепочка IPv4 не загружена"
+    fi
 else
     bad "Правила ufw-antiscan НЕ установлены"
 fi
@@ -35,17 +48,19 @@ fi
 # ── Portscan-баны ─────────────────────────────────────────────────────────────
 section "AntiScan (ipt_recent)"
 
-if [[ -f /proc/net/ipt_recent/PORTSCANNERS ]]; then
-    SCAN_COUNT=$(grep -c "^" /proc/net/ipt_recent/PORTSCANNERS 2>/dev/null || echo 0)
+RECENT_FILE=/proc/net/xt_recent/PORTSCANNERS
+[[ -r "$RECENT_FILE" ]] || RECENT_FILE=/proc/net/ipt_recent/PORTSCANNERS
+if [[ -r "$RECENT_FILE" ]]; then
+    SCAN_COUNT=$(wc -l < "$RECENT_FILE")
     if [[ "$SCAN_COUNT" -gt 0 ]]; then
-        warn "Заблокировано сканеров: ${SCAN_COUNT}"
+        warn "Записей recent (включая истёкшие): ${SCAN_COUNT}"
         echo ""
         echo -e "  ${BOLD}Последние 10 забаненных IP:${NC}"
         awk '{
             for(i=1;i<=NF;i++){
                 if($i ~ /^src=/) { gsub("src=","",$i); printf "    %s\n",$i }
             }
-        }' /proc/net/ipt_recent/PORTSCANNERS 2>/dev/null | tail -10
+        }' "$RECENT_FILE" 2>/dev/null | tail -10
     else
         ok "Активных portscan-банов нет"
     fi
@@ -57,8 +72,8 @@ fi
 section "Blocklists (ipset)"
 
 if command -v ipset &>/dev/null; then
-    V4_COUNT=$(ipset list "ANTISCAN-V4" 2>/dev/null | grep -c "^[0-9]" || echo 0)
-    V6_COUNT=$(ipset list "ANTISCAN-V6" 2>/dev/null | grep -c "^[0-9:]" || echo 0)
+    V4_COUNT=$(ipset list ANTISCAN-V4 2>/dev/null | awk '/^Number of entries:/ {n=$4} END {print n+0}' || true)
+    V6_COUNT=$(ipset list ANTISCAN-V6 2>/dev/null | awk '/^Number of entries:/ {n=$4} END {print n+0}' || true)
 
     if [[ "$V4_COUNT" -gt 0 || "$V6_COUNT" -gt 0 ]]; then
         ok "ipset активен: IPv4=${V4_COUNT} подсетей, IPv6=${V6_COUNT} подсетей"
@@ -88,7 +103,7 @@ if command -v fail2ban-client &>/dev/null; then
         ok "fail2ban запущен"
         F2B_OUT=$(fail2ban-client status sshd 2>/dev/null || true)
         if [[ -n "$F2B_OUT" ]]; then
-            BANNED=$(echo "$F2B_OUT" | awk '/Banned IP/{print $NF}')
+            BANNED=$(echo "$F2B_OUT" | awk '/Currently banned:/{print $NF}')
             TOTAL=$(echo "$F2B_OUT"  | awk '/Total banned/{print $NF}')
             echo "    Сейчас забанено: ${BANNED:-0}"
             echo "    Всего за всё время: ${TOTAL:-0}"
@@ -116,8 +131,8 @@ if command -v cscli &>/dev/null; then
         bad "CrowdSec bouncer не запущен"
     fi
 
-    DECISIONS=$(cscli decisions list 2>/dev/null | grep -c "^|" || echo 0)
-    ok "Активных блокировок (community + local): ${DECISIONS}"
+    DECISIONS=$(cscli decisions list -o json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin) or []))' 2>/dev/null || echo '?')
+    ok "Решений, возвращённых cscli: ${DECISIONS}"
 
     # Топ-5 активных банов
     TOP=$(cscli decisions list 2>/dev/null | grep "^|" | head -6 || true)
@@ -134,12 +149,12 @@ fi
 
 # ── Активные правила ──────────────────────────────────────────────────────────
 section "Правила UFW"
-ufw status numbered 2>/dev/null | grep -v "^$" | head -30
+ufw status numbered 2>/dev/null | sed -n '/./{p;}' | sed -n '1,30p' || warn "Не удалось прочитать правила UFW"
 
 echo ""
 echo -e "${BOLD}Команды управления:${NC}"
-echo "  Разбанить portscan-IP:    echo -<IP> > /proc/net/ipt_recent/PORTSCANNERS"
-echo "  Разбанить всех сканеров:  echo / > /proc/net/ipt_recent/PORTSCANNERS"
+echo "  Разбанить portscan-IP:    echo -<IP> > ${RECENT_FILE}"
+echo "  Разбанить всех сканеров:  echo / > ${RECENT_FILE}"
 echo "  Разбанить SSH (fail2ban): fail2ban-client unban <IP>"
 echo "  Разбанить (CrowdSec):     cscli decisions delete --ip <IP>"
 echo "  Откат:                    sudo bash install.sh rollback"

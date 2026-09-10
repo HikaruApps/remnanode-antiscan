@@ -12,7 +12,10 @@
 #
 # ENV-переменные: см. README.md
 
-set -euo pipefail
+set -Eeuo pipefail
+export LC_ALL=C
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/state.sh"
 
 # ── Цвета ─────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -21,7 +24,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 info()    { echo -e "${CYAN}[*]${NC} $*"; }
 ok()      { echo -e "${GREEN}[✔]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
-err()     { echo -e "${RED}[✘]${NC} $*" >&2; exit 1; }
+err()     { echo -e "${RED}[✘]${NC} $*" >&2; return 1; }
 dry()     { echo -e "${YELLOW}[DRY]${NC} $*"; }
 section() { echo -e "\n${BOLD}━━━ $* ━━━${NC}"; }
 
@@ -46,7 +49,9 @@ ENV-переменные:
   CONN_LIMIT                Макс одновременных соединений с одного IP (по умолчанию: 600)
   SSH_RATE / SSH_BURST      Лимит новых SSH-соед/мин до бана (по умолчанию: 6/4)
   PORTSCAN_BAN_SECONDS      Время бана за сканирование в секундах (по умолчанию: 3600)
-  ENABLE_PORTSCAN_BAN       1/0 — включить portscan autoban (по умолчанию: 1)
+  ENABLE_PORTSCAN_BAN       1/0 — включить portscan autoban (по умолчанию: 0)
+  PORTSCAN_HITS/WINDOW      Порог событий / окно в секундах (10 / 60)
+  SAFETY_TIMER             Время на подтверждение из нового SSH (180 секунд)
   ENABLE_CROWDSEC           1/0 — установить CrowdSec (по умолчанию: 1)
   CROWDSEC_ENROLL_KEY       Ключ из app.crowdsec.net (опционально)
   ENABLE_BLOCKLISTS         1/0 — загрузить IP-blocklists в ipset (по умолчанию: 1)
@@ -69,17 +74,22 @@ HELP
 fi
 
 # ── Параметры ─────────────────────────────────────────────────────────────────
-[[ "${1:-}" == "--dry-run" ]] && export DRY_RUN=1
+case "${1:-}" in
+    "") ;;
+    --dry-run) export DRY_RUN=1 ;;
+    *) err "Unknown argument: $1" ;;
+esac
+[[ $# -le 1 ]] || err "Too many arguments"
 
 DRY_RUN="${DRY_RUN:-0}"
 
 SSH_PORT="${SSH_PORT:-$(ss -tlnp 2>/dev/null \
     | awk '/sshd/{match($4,/[0-9]+$/); p=substr($4,RSTART,RLENGTH); if(p) print p}' \
-    | head -1)}"
+    | head -1 || true)}"
 SSH_PORT="${SSH_PORT:-22}"
 
 TCP_PORTS="${TCP_PORTS:-443,2087}"
-UDP_PORTS="${UDP_PORTS:-443}"
+UDP_PORTS="${UDP_PORTS-443}"
 
 SYN_RATE="${SYN_RATE:-100}"
 SYN_BURST="${SYN_BURST:-200}"
@@ -89,12 +99,14 @@ SSH_RATE="${SSH_RATE:-6}"
 SSH_BURST="${SSH_BURST:-4}"
 
 PORTSCAN_BAN_SECONDS="${PORTSCAN_BAN_SECONDS:-3600}"
-ENABLE_PORTSCAN_BAN="${ENABLE_PORTSCAN_BAN:-1}"
+ENABLE_PORTSCAN_BAN="${ENABLE_PORTSCAN_BAN:-0}"
+PORTSCAN_HITS="${PORTSCAN_HITS:-10}"
+PORTSCAN_WINDOW="${PORTSCAN_WINDOW:-60}"
 
 WHITELIST="${WHITELIST:-}"
 
 # Safety timer: автоматический откат если что-то пошло не так (секунд)
-SAFETY_TIMER="${SAFETY_TIMER:-60}"
+SAFETY_TIMER="${SAFETY_TIMER:-180}"
 
 ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-1}"
 CROWDSEC_ENROLL_KEY="${CROWDSEC_ENROLL_KEY:-}"
@@ -112,7 +124,7 @@ IPSET_BOOTSTRAP_SCRIPT="/usr/local/bin/ufw-antiscan-ensure-ipsets.sh"
 MARKER_START="# === UFW-ANTISCAN START ==="
 MARKER_END="# === UFW-ANTISCAN END ==="
 
-BACKUP_DIR="/var/backups/ufw-antiscan/$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR=""
 
 # ── Проверки ──────────────────────────────────────────────────────────────────
 section "Проверка окружения"
@@ -122,6 +134,9 @@ command -v ufw      &>/dev/null || err "ufw не установлен. Уста�
 command -v iptables &>/dev/null || err "iptables не найден"
 command -v iptables-restore &>/dev/null || err "iptables-restore не найден"
 command -v python3  &>/dev/null || err "python3 не найден. Установи: apt install python3"
+if [[ "$ENABLE_BLOCKLISTS" == 1 || "$ENABLE_CROWDSEC" == 1 ]]; then
+    command -v curl >/dev/null || err "curl is required: apt install curl"
+fi
 
 # Проверка поддерживаемой ОС
 if [[ -f /etc/os-release ]]; then
@@ -144,15 +159,16 @@ if [[ -f /etc/os-release ]]; then
 fi
 
 UFW_STATUS=$(ufw status 2>/dev/null | head -1 || true)
-[[ "$UFW_STATUS" != *"active"* ]] && \
+[[ "$UFW_STATUS" != "Status: active" ]] && \
     warn "UFW сейчас неактивен — правила применятся после: sudo ufw enable"
 
 WAN_IFACE=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1 || true)
-[[ -z "$WAN_IFACE" ]] &&     warn "WAN-интерфейс не определён — anti-spoofing без привязки к интерфейсу"
+[[ -z "$WAN_IFACE" ]] && warn "WAN-интерфейс не определён — anti-spoofing будет отключён"
 
 # Авто-детект: если у сервера приватный IP (VPS за NAT) — anti-spoofing опасен
 MY_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1 || true)
 ENABLE_ANTISPOOFING="${ENABLE_ANTISPOOFING:-1}"
+[[ -n "$WAN_IFACE" ]] || ENABLE_ANTISPOOFING=0
 if [[ "${ENABLE_ANTISPOOFING}" == "1" && -n "$MY_IP" ]]; then
     if [[ "$MY_IP" =~ ^10\. ||           "$MY_IP" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ||           "$MY_IP" =~ ^192\.168\. ||           "$MY_IP" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]; then
         warn "Обнаружен приватный IP сервера (${MY_IP}) — anti-spoofing ОТКЛЮЧЁН"
@@ -163,7 +179,7 @@ fi
 
 # Проверка что hashlimit и recent доступны
 if ! iptables -m hashlimit --help &>/dev/null 2>&1; then
-    warn "Модуль iptables 'hashlimit' недоступен — rate-limiting будет пропущен"
+    err "Модуль iptables hashlimit недоступен"
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -180,30 +196,52 @@ info "CrowdSec:  ${ENABLE_CROWDSEC}"
 info "Blocklists: ${ENABLE_BLOCKLISTS}"
 info "DRY RUN:   ${DRY_RUN}"
 
-# ── Бэкап ─────────────────────────────────────────────────────────────────────
-if [[ "$DRY_RUN" == "0" ]]; then
-    section "Бэкап"
-    mkdir -p "$BACKUP_DIR"
-    cp /etc/ufw/before.rules "$BACKUP_DIR/before.rules.bak"
-    [[ -f /etc/ufw/before6.rules ]] && \
-        cp /etc/ufw/before6.rules "$BACKUP_DIR/before6.rules.bak"
-    iptables-save > "$BACKUP_DIR/iptables.bak"
-    ok "Бэкап → $BACKUP_DIR"
-fi
+# Validate input before any filesystem or service changes.
+python3 - "$SSH_PORT" "$TCP_PORTS" "$UDP_PORTS" "$WHITELIST" \
+    "$SYN_RATE" "$SYN_BURST" "$CONN_LIMIT" "$SSH_RATE" "$SSH_BURST" \
+    "$PORTSCAN_BAN_SECONDS" "$PORTSCAN_HITS" "$PORTSCAN_WINDOW" "$SAFETY_TIMER" \
+    "$DRY_RUN" "$ENABLE_CROWDSEC" "$ENABLE_BLOCKLISTS" "$ENABLE_PORTSCAN_BAN" "$ENABLE_ANTISPOOFING" <<'VALIDATE'
+import ipaddress
+import sys
+ssh, tcp, udp, whitelist = sys.argv[1:5]
+for ports in (ssh, tcp, udp):
+    if ports:
+        for port in ports.split(','):
+            if not port.strip().isascii() or not port.strip().isdigit() or not 1 <= int(port) <= 65535:
+                raise SystemExit('Invalid port: ' + repr(port))
+if ',' in ssh or not ssh:
+    raise SystemExit('SSH_PORT must be one port')
+for entry in filter(None, whitelist.split(',')):
+    ipaddress.ip_network(entry.strip(), strict=False)
+for value in sys.argv[5:14]:
+    if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= 2147483647:
+        raise SystemExit('Limits and SAFETY_TIMER must be positive integers')
+for value in sys.argv[14:]:
+    if value not in ('0', '1'):
+        raise SystemExit('Feature flags must be 0 or 1')
+VALIDATE
+[[ "$BLOCKLIST_UPDATE_INTERVAL" =~ ^[1-9][0-9]*[smhd]$ ]] || err "Invalid update interval"
 
 # ── Генерация правил ──────────────────────────────────────────────────────────
 build_rules() {
     local FAMILY="$1"
     local CHAIN
-    [[ "$FAMILY" == "6" ]] && CHAIN="ufw6-before-input" || CHAIN="ufw-before-input"
+    [[ "$FAMILY" == "6" ]] && CHAIN="ufw6-antiscan" || CHAIN="ufw-antiscan"
 
     echo ""
     echo "$MARKER_START"
     echo "# Установлено ufw-antiscan $(date)"
+    echo ":${CHAIN} - [0:0]"
+    if [[ "$FAMILY" == "6" ]]; then
+        echo "-A ufw6-before-input -j ${CHAIN}"
+    else
+        echo "-A ufw-before-input -j ${CHAIN}"
+    fi
+    echo "-A ${CHAIN} -i lo -j RETURN"
     echo ""
 
     # Whitelist должен идти раньше всех DROP-правил, включая blocklists.
-    # RETURN выводит пакет из ufw-before-input обратно в основную UFW-цепочку,
+    # RETURN выводит пакет из отдельной цепочки обратно в ufw-before-input,
     # не обходя пользовательские ALLOW/DENY-правила.
     if [[ -n "$WHITELIST" ]]; then
         echo "# ── Whitelist ──────────────────────────────────────────────────────"
@@ -246,6 +284,15 @@ build_rules() {
     echo "-A ${CHAIN} -p tcp --tcp-flags ACK,URG URG -j DROP"
     echo ""
 
+    # Preserve replies and related ICMP (including PMTU errors from private routers).
+    echo "-A ${CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN"
+    # Let normal UFW policy handle DHCP replies; they are not scan attempts.
+    if [[ "$FAMILY" == "4" ]]; then
+        echo "-A ${CHAIN} -p udp --sport 67 --dport 68 -j RETURN"
+    else
+        echo "-A ${CHAIN} -p udp --sport 547 --dport 546 -j RETURN"
+    fi
+
     # Anti-spoofing только IPv4 и только если сервер имеет публичный IP
     if [[ "$FAMILY" == "4" && "$ENABLE_ANTISPOOFING" == "1" ]]; then
         local SIFACE=""
@@ -258,6 +305,13 @@ build_rules() {
             echo "-A ${CHAIN} ${SIFACE} -s ${NET} -j DROP"
         done
         echo ""
+    fi
+
+    # Do not let source bans interfere with IPv6 neighbour discovery.
+    if [[ "$FAMILY" == "6" ]]; then
+        for kind in 133 134 135 136; do
+            echo "-A ${CHAIN} -p ipv6-icmp --icmpv6-type ${kind} -j RETURN"
+        done
     fi
 
     # AntiScan: забаненные — сразу дроп (должно быть первым)
@@ -281,9 +335,9 @@ build_rules() {
     for p in "${TPORTS[@]}"; do
         p="${p// /}"
         if [[ "$FAMILY" == "4" ]]; then
-            echo "-A ${CHAIN} -p tcp --dport ${p} -m connlimit --connlimit-above ${CONN_LIMIT} --connlimit-mask 32 -j DROP"
+            echo "-A ${CHAIN} -p tcp --dport ${p} --syn -m connlimit --connlimit-above ${CONN_LIMIT} --connlimit-mask 32 -j DROP"
         else
-            echo "-A ${CHAIN} -p tcp --dport ${p} -m connlimit --connlimit-above ${CONN_LIMIT} --connlimit-mask 128 -j DROP"
+            echo "-A ${CHAIN} -p tcp --dport ${p} --syn -m connlimit --connlimit-above ${CONN_LIMIT} --connlimit-mask 128 -j DROP"
         fi
     done
     echo ""
@@ -308,8 +362,13 @@ build_rules() {
         done
         echo ""
         echo "# SYN/UDP на нессервисный порт → в список сканеров + DROP"
-        echo "-A ${CHAIN} -p tcp --syn -m recent --name PORTSCANNERS --set -j DROP"
-        echo "-A ${CHAIN} -p udp -m state --state NEW -m recent --name PORTSCANNERS --set -j DROP"
+        for proto in tcp udp; do
+            local flags=""
+            [[ "$proto" == tcp ]] && flags="--syn"
+            echo "-A ${CHAIN} -p ${proto} ${flags} -m conntrack --ctstate NEW -m recent --name SCANHITS --set"
+            echo "-A ${CHAIN} -p ${proto} ${flags} -m conntrack --ctstate NEW -m recent --name SCANHITS --rcheck --seconds ${PORTSCAN_WINDOW} --hitcount ${PORTSCAN_HITS} -m recent --name PORTSCANNERS --set -j DROP"
+            echo "-A ${CHAIN} -p ${proto} ${flags} -m conntrack --ctstate NEW -j DROP"
+        done
     fi
     echo ""
 
@@ -323,45 +382,6 @@ build_rules() {
     echo ""
     echo "$MARKER_END"
     echo ""
-}
-
-# ── Вставка правил в файл ─────────────────────────────────────────────────────
-inject_rules() {
-    local FILE="$1"
-    local RULES="$2"
-
-    # Удаляем старый блок если есть
-    if grep -q "UFW-ANTISCAN START" "$FILE" 2>/dev/null; then
-        python3 -c "
-import re
-with open('${FILE}', 'r') as f:
-    c = f.read()
-c = re.sub(r'# === UFW-ANTISCAN START ===.*?# === UFW-ANTISCAN END ===\n?', '', c, flags=re.DOTALL)
-with open('${FILE}', 'w') as f:
-    f.write(c)
-"
-    fi
-
-    python3 - "$FILE" "$RULES" << 'PYEOF'
-import sys
-
-filepath = sys.argv[1]
-rules = sys.argv[2]
-
-with open(filepath, 'r') as f:
-    content = f.read()
-
-anchor = "# ok icmp codes for INPUT"
-if anchor in content:
-    content = content.replace(anchor, rules + "\n" + anchor, 1)
-else:
-    idx = content.rfind('COMMIT')
-    if idx != -1:
-        content = content[:idx] + rules + "\n" + content[idx:]
-
-with open(filepath, 'w') as f:
-    f.write(content)
-PYEOF
 }
 
 # ── DRY RUN или применение ────────────────────────────────────────────────────
@@ -380,12 +400,56 @@ if [[ "$DRY_RUN" == "1" ]]; then
     exit 0
 fi
 
-inject_rules /etc/ufw/before.rules "$RULES_V4"
-ok "IPv4 → /etc/ufw/before.rules"
-
+# Serialize changes and preserve the pre-install state for uninstall.
+command -v flock >/dev/null || err "flock is required"
+command -v systemd-run >/dev/null || err "systemd-run is required"
+[[ "$UFW_STATUS" == "Status: active" ]] || err "Enable and configure UFW before applying AntiScan"
+iptables -S >/dev/null || err "Cannot read netfilter rules: CAP_NET_ADMIN is required"
+systemctl show-environment >/dev/null || err "A running systemd manager is required"
+exec 9>/run/lock/ufw-antiscan.lock
+flock -n 9 || err "Another AntiScan operation is running"
+mkdir -p "$STATE" /var/backups/ufw-antiscan
+chmod 700 "$STATE"
+[[ ! -f "$PENDING" ]] || err "Confirm or roll back the pending application first"
+BACKUP_DIR=$(mktemp -d /var/backups/ufw-antiscan/apply.XXXXXXXX)
+snapshot "$BACKUP_DIR"
+if [[ ! -d "$STATE/original" ]]; then
+    ORIGINAL_STAGE=$(mktemp -d "$STATE/original.XXXXXXXX")
+    cp -a "$BACKUP_DIR/." "$ORIGINAL_STAGE/"
+    mv -T "$ORIGINAL_STAGE" "$STATE/original"
+fi
+printf '%s' "${SSH_CONNECTION:-}" > "$BACKUP_DIR/ssh-connection"
+rollback_on_error() {
+    local code=$?
+    trap - ERR INT TERM HUP
+    echo "Application failed; restoring $BACKUP_DIR" >&2
+    if restore_snapshot "$BACKUP_DIR"; then
+        rm -f "$PENDING"
+    else
+        echo "RESTORE FAILED. Backup: $BACKUP_DIR" >&2
+    fi
+    exit "$code"
+}
+trap rollback_on_error ERR
+trap 'false' INT TERM HUP
+# Keep recovery code installed even when restoring the first application fails.
+mkdir -p /usr/local/lib/ufw-antiscan
+install -m 644 "$SCRIPT_DIR/state.sh" /usr/local/lib/ufw-antiscan/state.sh
+install -m 755 "$SCRIPT_DIR/restore.sh" /usr/local/lib/ufw-antiscan/restore.sh
+# Arm before modifying optional services or live ipsets, not just before UFW.
+arm_safety "$BACKUP_DIR" "$SAFETY_TIMER"
+# Stop an old updater before replacing its executable/configuration.
+systemctl stop ufw-antiscan-blocklists.timer ufw-antiscan-blocklists.service 2>/dev/null || true
+# Stage UFW files: no live firewall file is changed until validation succeeds.
+STAGE="$BACKUP_DIR/stage"
+mkdir -p "$STAGE"
+printf '%s\n' "$RULES_V4" > "$STAGE/rules4"
+printf '%s\n' "$RULES_V6" > "$STAGE/rules6"
+cp -a /etc/ufw/before.rules "$STAGE/before.rules"
+python3 "$SCRIPT_DIR/rules.py" inject "$STAGE/before.rules" "$STAGE/rules4" 4
 if [[ -f /etc/ufw/before6.rules ]]; then
-    inject_rules /etc/ufw/before6.rules "$RULES_V6"
-    ok "IPv6 → /etc/ufw/before6.rules"
+    cp -a /etc/ufw/before6.rules "$STAGE/before6.rules"
+    python3 "$SCRIPT_DIR/rules.py" inject "$STAGE/before6.rules" "$STAGE/rules6" 6
 fi
 
 # ── Blocklists (ipset) ───────────────────────────────────────────────────────
@@ -402,82 +466,12 @@ setup_blocklists() {
 
     # Создаём скрипт обновления
     info "Создаю скрипт обновления: ${BLOCKLIST_UPDATE_SCRIPT}"
-    cat > "${BLOCKLIST_UPDATE_SCRIPT}" << 'UPDSCRIPT'
-#!/bin/bash
-# Авто-обновление ipset blocklists для ufw-antiscan
-# Запускается systemd-таймером
-
-set -euo pipefail
-
-IPSET_NAME_V4="ANTISCAN-V4"
-IPSET_NAME_V6="ANTISCAN-V6"
-TMP_V4="ANTISCAN-V4-TMP"
-TMP_V6="ANTISCAN-V6-TMP"
-
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
-
-log "Обновление blocklists..."
-
-# Читаем URL из конфига
-CONF="/etc/ufw-antiscan/blocklists.conf"
-if [[ ! -f "$CONF" ]]; then
-    log "ОШИБКА: конфиг не найден: $CONF"
-    exit 1
-fi
-mapfile -t URLS < "$CONF"
-
-# Создаём временные сеты
-ipset create "$TMP_V4" hash:net family inet  hashsize 65536 maxelem 500000 2>/dev/null || ipset flush "$TMP_V4"
-ipset create "$TMP_V6" hash:net family inet6 hashsize 65536 maxelem 500000 2>/dev/null || ipset flush "$TMP_V6"
-
-TOTAL_V4=0
-TOTAL_V6=0
-
-for URL in "${URLS[@]}"; do
-    [[ -z "$URL" || "$URL" == \#* ]] && continue
-    log "Скачиваю: $URL"
-
-    LINES=$(curl -fsSL --max-time 30 "$URL" 2>/dev/null || true)
-    if [[ -z "$LINES" ]]; then
-        log "WARN: не удалось скачать $URL — пропускаю"
-        continue
-    fi
-
-    while IFS= read -r line; do
-        line="${line%%#*}"   # убираем комментарии
-        line="${line// /}"   # убираем пробелы
-        [[ -z "$line" ]] && continue
-
-        if [[ "$line" == *:* ]]; then
-            ipset add "$TMP_V6" "$line" 2>/dev/null && ((TOTAL_V6++)) || true
-        else
-            ipset add "$TMP_V4" "$line" 2>/dev/null && ((TOTAL_V4++)) || true
-        fi
-    done <<< "$LINES"
-done
-
-# Атомарный swap (нет разрыва защиты во время обновления)
-ipset create "$IPSET_NAME_V4" hash:net family inet  hashsize 65536 maxelem 500000 2>/dev/null || true
-ipset create "$IPSET_NAME_V6" hash:net family inet6 hashsize 65536 maxelem 500000 2>/dev/null || true
-ipset swap "$TMP_V4" "$IPSET_NAME_V4"
-ipset swap "$TMP_V6" "$IPSET_NAME_V6"
-ipset destroy "$TMP_V4" 2>/dev/null || true
-ipset destroy "$TMP_V6" 2>/dev/null || true
-
-log "Готово: IPv4=${TOTAL_V4} подсетей, IPv6=${TOTAL_V6} подсетей"
-UPDSCRIPT
-
+    install -m 755 "$SCRIPT_DIR/update-blocklists.sh" "$BLOCKLIST_UPDATE_SCRIPT"
     chmod +x "${BLOCKLIST_UPDATE_SCRIPT}"
 
     # ipset-наборы не переживают перезагрузку. Создаём их до запуска UFW,
     # иначе iptables-restore не сможет загрузить before.rules при старте ОС.
-    cat > "${IPSET_BOOTSTRAP_SCRIPT}" << 'BOOTSTRAP'
-#!/bin/sh
-set -eu
-
-ipset create ANTISCAN-V4 hash:net family inet  hashsize 65536 maxelem 500000 2>/dev/null || true
-ipset create ANTISCAN-V6 hash:net family inet6 hashsize 65536 maxelem 500000 2>/dev/null || true
-BOOTSTRAP
+    install -m 755 "$SCRIPT_DIR/ensure-ipsets.sh" "$IPSET_BOOTSTRAP_SCRIPT"
     chmod +x "${IPSET_BOOTSTRAP_SCRIPT}"
 
     cat > /etc/systemd/system/ufw-antiscan-ipsets.service << BOOTEOF
@@ -518,7 +512,13 @@ DROPINEOF
 
     # Запускаем первое обновление сразу
     info "Первичная загрузка списков (может занять несколько секунд)..."
-    bash "${BLOCKLIST_UPDATE_SCRIPT}" && ok "Blocklists загружены" || warn "Ошибка загрузки — проверь интернет-доступ"
+    if bash "$BLOCKLIST_UPDATE_SCRIPT"; then
+        ok "Blocklists загружены"
+    elif [[ -s "$STATE/current.restore" ]]; then
+        warn "Обновление не удалось; сохранён последний успешный список"
+    else
+        err "Первичная загрузка blocklists не удалась"
+    fi
 
     # Systemd-таймер для авто-обновления
     cat > /etc/systemd/system/ufw-antiscan-blocklists.service << SVCEOF
@@ -560,6 +560,8 @@ TMREOF
 
 if [[ "$ENABLE_BLOCKLISTS" == "1" && "$DRY_RUN" == "0" ]]; then
     setup_blocklists
+elif [[ "$ENABLE_BLOCKLISTS" == "0" ]]; then
+    systemctl disable --now ufw-antiscan-blocklists.timer 2>/dev/null || true
 elif [[ "$ENABLE_BLOCKLISTS" == "1" && "$DRY_RUN" == "1" ]]; then
     dry "Blocklists: будут загружены из:"
     for URL in $BLOCKLIST_URLS; do
@@ -619,8 +621,8 @@ https://packagecloud.io/crowdsec/crowdsec/${ID} ${VERSION_CODENAME} main" \
         ok "CrowdSec уже установлен"
     fi
 
-    # Bouncer для iptables (UFW использует iptables, не nftables)
-    if ! dpkg -l crowdsec-firewall-bouncer-iptables &>/dev/null 2>&1; then
+    # Bouncer через iptables; фактический backend может быть legacy или nft.
+    if [[ "$(dpkg-query -W -f='${Status}' crowdsec-firewall-bouncer-iptables 2>/dev/null || true)" != "install ok installed" ]]; then
         info "Устанавливаю crowdsec-firewall-bouncer-iptables..."
         apt-get install -y -q crowdsec-firewall-bouncer-iptables
         ok "iptables-bouncer установлен"
@@ -630,11 +632,11 @@ https://packagecloud.io/crowdsec/crowdsec/${ID} ${VERSION_CODENAME} main" \
 
     # Базовые коллекции
     info "Устанавливаю коллекции..."
-    cscli collections install crowdsecurity/linux    -q 2>/dev/null || true
-    cscli collections install crowdsecurity/sshd     -q 2>/dev/null || true
-    cscli collections install crowdsecurity/iptables -q 2>/dev/null || true
-    cscli collections install crowdsecurity/http-cve -q 2>/dev/null || true
-    ok "Коллекции установлены"
+    cscli collections install crowdsecurity/linux -q || warn "Коллекция linux не установлена"
+    cscli collections install crowdsecurity/sshd -q || warn "Коллекция sshd не установлена"
+    cscli collections install crowdsecurity/iptables -q || warn "Коллекция iptables не установлена"
+    cscli collections install crowdsecurity/http-cve -q || warn "Коллекция http-cve не установлена"
+    info "Проверь acquisition и метрики CrowdSec для нужных источников логов"
 
     # Enroll в Console (опционально)
     if [[ -n "$CROWDSEC_ENROLL_KEY" ]]; then
@@ -660,7 +662,7 @@ validate_ufw_rules() {
     local failed=0
 
     info "Проверяю синтаксис /etc/ufw/before.rules..."
-    if ! iptables-restore --test < /etc/ufw/before.rules; then
+    if ! iptables-restore --test < "$STAGE/before.rules"; then
         warn "Ошибка синтаксиса IPv4 ruleset"
         failed=1
     fi
@@ -671,21 +673,14 @@ validate_ufw_rules() {
             failed=1
         else
             info "Проверяю синтаксис /etc/ufw/before6.rules..."
-            if ! ip6tables-restore --test < /etc/ufw/before6.rules; then
+            if ! ip6tables-restore --test < "$STAGE/before6.rules"; then
                 warn "Ошибка синтаксиса IPv6 ruleset"
                 failed=1
             fi
         fi
     fi
 
-    if [[ "$failed" != "0" ]]; then
-        warn "Возвращаю исходные UFW-файлы из бэкапа"
-        cp "$BACKUP_DIR/before.rules.bak" /etc/ufw/before.rules
-        if [[ -f "$BACKUP_DIR/before6.rules.bak" ]]; then
-            cp "$BACKUP_DIR/before6.rules.bak" /etc/ufw/before6.rules
-        fi
-        err "Правила не применены. Исходные UFW-файлы восстановлены: $BACKUP_DIR"
-    fi
+    [[ "$failed" == 0 ]] || return 1
 
     ok "Синтаксис IPv4/IPv6 правил корректен"
 }
@@ -695,101 +690,23 @@ section "Применение"
 
 validate_ufw_rules
 
-# Safety timer: если через SAFETY_TIMER секунд скрипт ещё не завершился нормально,
-# автоматически восстанавливаем бэкап. Защита от потери SSH-доступа.
-SAFETY_PID=""
-if [[ "$SAFETY_TIMER" -gt 0 ]]; then
-    (
-        sleep "$SAFETY_TIMER"
-        echo ""
-        echo -e "\033[0;31m[!] SAFETY ROLLBACK: $SAFETY_TIMER сек прошло, что-то пошло не так!\033[0m"
-        echo -e "\033[0;31m[!] Восстанавливаю исходные правила из бэкапа...\033[0m"
-        cp "$BACKUP_DIR/before.rules.bak" /etc/ufw/before.rules 2>/dev/null || true
-        [[ -f "$BACKUP_DIR/before6.rules.bak" ]] &&             cp "$BACKUP_DIR/before6.rules.bak" /etc/ufw/before6.rules 2>/dev/null || true
-        ufw reload 2>/dev/null || true
-        echo -e "\033[0;32m[✔] Исходные правила восстановлены\033[0m"
-    ) &
-    SAFETY_PID=$!
-    info "Safety timer запущен (PID ${SAFETY_PID}): автооткат через ${SAFETY_TIMER} сек"
+# Reset the deadline after dependency preparation, before applying UFW.
+arm_safety "$BACKUP_DIR" "$SAFETY_TIMER"
+# Atomic rename within /etc/ufw, retaining the original permissions.
+cp -a "$STAGE/before.rules" /etc/ufw/before.rules.antiscan-new
+mv -f /etc/ufw/before.rules.antiscan-new /etc/ufw/before.rules
+if [[ -f "$STAGE/before6.rules" ]]; then
+    cp -a "$STAGE/before6.rules" /etc/ufw/before6.rules.antiscan-new
+    mv -f /etc/ufw/before6.rules.antiscan-new /etc/ufw/before6.rules
 fi
-
-systemctl enable --now fail2ban 2>/dev/null || true
+systemctl enable --now fail2ban
 systemctl restart fail2ban
 ufw reload
-
-# Проверяем что SSH-порт слушает после применения
-sleep 2
-if ss -tlnp 2>/dev/null | grep -q ":${SSH_PORT} "; then
-    ok "SSH (порт ${SSH_PORT}) слушает — соединение не потеряно"
-else
-    warn "SSH-порт ${SSH_PORT} не обнаружен после reload!"
-fi
-
-# Отменяем safety timer — всё ок
-if [[ -n "$SAFETY_PID" ]]; then
-    kill "$SAFETY_PID" 2>/dev/null &&         ok "Safety timer отменён — правила применены успешно" || true
-fi
+warn "Проверь новое SSH-подключение и VPN. Автооткат через ${SAFETY_TIMER} секунд."
+warn "Из НОВОГО SSH-подключения: sudo --preserve-env=SSH_CONNECTION bash install.sh confirm"
 
 ok "UFW перезагружен, fail2ban запущен"
 
-# ── Финальный статус ──────────────────────────────────────────────────────────
-section "Статус"
-
-echo ""
-echo -e "${BOLD}Правила UFW:${NC}"
-ufw status numbered 2>/dev/null | head -20
-
-echo ""
-echo -e "${BOLD}Portscan-баны:${NC}"
-RECENT_FILE=""
-for candidate in \
-    /proc/net/xt_recent/PORTSCANNERS \
-    /proc/net/ipt_recent/PORTSCANNERS; do
-    if [[ -r "$candidate" ]]; then
-        RECENT_FILE="$candidate"
-        break
-    fi
-done
-
-if [[ -n "$RECENT_FILE" ]]; then
-    SCAN_COUNT=$(wc -l < "$RECENT_FILE")
-else
-    SCAN_COUNT=0
-fi
-echo "  Заблокировано IP: ${SCAN_COUNT}"
-
-echo ""
-echo -e "${BOLD}fail2ban SSH:${NC}"
-fail2ban-client status sshd 2>/dev/null || true
-
-if [[ "$ENABLE_BLOCKLISTS" == "1" ]]; then
-    echo ""
-    echo -e "${BOLD}Blocklists (ipset):${NC}"
-    V4_COUNT=$(ipset list "${IPSET_NAME_V4}" 2>/dev/null | awk '/^Number of entries:/ {print $4; found=1} END {if (!found) print 0}')
-    V6_COUNT=$(ipset list "${IPSET_NAME_V6}" 2>/dev/null | awk '/^Number of entries:/ {print $4; found=1} END {if (!found) print 0}')
-    echo "  Загружено подсетей: IPv4=${V4_COUNT}, IPv6=${V6_COUNT}"
-    NEXT=$(systemctl status ufw-antiscan-blocklists.timer 2>/dev/null | awk '/Trigger:/{print $2,$3}' || echo 'нет таймера')
-    echo "  Следующее обновление: ${NEXT}"
-fi
-
-if [[ "$ENABLE_CROWDSEC" == "1" ]]; then
-    echo ""
-    echo -e "${BOLD}CrowdSec:${NC}"
-    CSEC_COUNT=$(cscli decisions list 2>/dev/null | wc -l || echo '?')
-    echo "  Активных блокировок: ${CSEC_COUNT}"
-fi
-
-echo ""
-echo -e "${GREEN}${BOLD}✔ Готово!${NC}"
-echo ""
-echo -e "${BOLD}Полезные команды:${NC}"
-echo "  Статус:                   sudo bash install.sh status"
-echo "  Откат:                    sudo bash install.sh rollback"
-RECENT_FILE_DISPLAY="${RECENT_FILE:-/proc/net/xt_recent/PORTSCANNERS}"
-echo "  Portscan-баны:            cat ${RECENT_FILE_DISPLAY}"
-echo "  Разбанить всех сканеров:  echo / > ${RECENT_FILE_DISPLAY}"
-echo "  SSH-баны:                 fail2ban-client status sshd"
-echo "  CrowdSec-баны:            cscli decisions list"
-echo "  Blocklist-статистика:     ipset list ANTISCAN-V4 | tail -3"
-echo "  Обновить blocklists:      systemctl start ufw-antiscan-blocklists"
-echo ""
+# The timer stays armed until an explicit confirmation from a new connection.
+trap - ERR INT TERM HUP
+ok "Применено, ожидается подтверждение. Бэкап: $BACKUP_DIR"

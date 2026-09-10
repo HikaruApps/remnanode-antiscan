@@ -12,6 +12,9 @@ set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+if [[ ! -t 1 || -n ${NO_COLOR:-} ]]; then
+    RED='' GREEN='' YELLOW='' CYAN='' BOLD='' NC=''
+fi
 
 err()    { echo -e "${RED}[✘]${NC} $*" >&2; exit 1; }
 info()   { echo -e "${CYAN}[*]${NC} $*"; }
@@ -30,8 +33,10 @@ ufw-antiscan — защита от сканеров и флуда поверх U
 
 Команды:
   protect    Установить защиту (iptables-правила + fail2ban + CrowdSec)
-  rollback   Откатить все изменения
+  confirm    Подтвердить применение из нового SSH-подключения
+  rollback   Удалить защиту и восстановить прежние настройки
   status     Показать текущий статус защиты
+  update     Обновить файлы проекта из GitHub
   --help     Показать эту справку
 
 ENV для команды protect:
@@ -46,8 +51,7 @@ ENV для команды protect:
   ENABLE_BLOCKLISTS     1/0 — загрузить IP-blocklists в ipset (по умолч.: 1)
   DRY_RUN               1 — показать правила без применения
 
-ENV для команды rollback:
-  PURGE_CROWDSEC        1 — удалить CrowdSec полностью (по умолч.: 0)
+  SAFETY_TIMER          Время на подтверждение (по умолч.: 180 секунд)
 
 Примеры:
   sudo SSH_PORT=22 TCP_PORTS=443,2087 UDP_PORTS=443 \
@@ -55,20 +59,17 @@ ENV для команды rollback:
 
   sudo DRY_RUN=1 bash install.sh protect
   sudo ENABLE_CROWDSEC=0 bash install.sh protect
-  sudo PURGE_CROWDSEC=1 bash install.sh rollback
+  sudo --preserve-env=SSH_CONNECTION bash install.sh confirm
 HELP
 }
 
 show_banner() {
-    echo ""
-    echo -e "${BOLD}${CYAN}"
-    echo "  ╦ ╦╔═╗╦ ╦   ╔═╗╔╗╔╔╦╗╦╔═╗╔═╗╔═╗╔╗╔"
-    echo "  ║ ║╠╣ ║║║───╠═╣║║║ ║ ║╚═╗║  ╠═╣║║║"
-    echo "  ╚═╝╚  ╚╩╝   ╩ ╩╝╚╝ ╩ ╩╚═╝╚═╝╩ ╩╝╚╝"
-    echo -e "${NC}"
-    echo -e "  ${BOLD}AntiScan + flag-drop + rate-limit + CrowdSec поверх UFW${NC}"
-    echo -e "  Для Remnawave-нод и любых VPS с UFW"
-    echo ""
+    printf '\n  %bRemnaNode AntiScan%b\n' "$BOLD$CYAN" "$NC"
+    printf '  Защита ноды · UFW · Управление\n'
+    if [[ -f /var/lib/ufw-antiscan/pending ]]; then
+        printf '  %bОжидается подтверждение — автооткат включён%b\n' "$YELLOW" "$NC"
+    fi
+    printf '\n'
 }
 
 # Читает ввод с дефолтом: ask "Вопрос" "дефолт" → результат в $REPLY
@@ -104,25 +105,25 @@ ask_protect_params() {
         | head -1)
     ssh_detected="${ssh_detected:-22}"
 
-    ask "SSH-порт" "$ssh_detected"
+    ask "SSH-порт" "${SSH_PORT:-$ssh_detected}"
     PARAM_SSH_PORT="$REPLY"
 
-    ask "TCP-порты сервиса (через запятую)" "443,2087"
+    ask "TCP-порты сервиса (через запятую)" "${TCP_PORTS:-443,2087}"
     PARAM_TCP_PORTS="$REPLY"
 
-    ask "UDP-порты сервиса (через запятую)" "443"
+    ask "UDP-порты сервиса (через запятую)" "${UDP_PORTS-443}"
     PARAM_UDP_PORTS="$REPLY"
 
-    ask "Whitelist IP/CIDR (через запятую, или оставь пустым)" ""
+    ask "Whitelist IP/CIDR (через запятую, или оставь пустым)" "${WHITELIST:-}"
     PARAM_WHITELIST="$REPLY"
 
     echo ""
     echo -e "  ${BOLD}Дополнительные компоненты:${NC}"
 
-    yn "Установить CrowdSec (community blocklist + IPS)?" "y"
+    yn "Установить CrowdSec (community blocklist + IPS)?" "$([[ ${ENABLE_CROWDSEC:-1} == 1 ]] && echo y || echo n)"
     PARAM_CROWDSEC="$YN"
 
-    yn "Загрузить IP-blocklists в ipset (antiscanner + gov)?" "y"
+    yn "Загрузить IP-blocklists в ipset (antiscanner + gov)?" "$([[ ${ENABLE_BLOCKLISTS:-1} == 1 ]] && echo y || echo n)"
     PARAM_BLOCKLISTS="$YN"
 
     if [[ "$PARAM_CROWDSEC" == "1" ]]; then
@@ -132,7 +133,7 @@ ask_protect_params() {
         PARAM_ENROLL_KEY=""
     fi
 
-    yn "DRY RUN — только показать правила, не применять?" "n"
+    yn "DRY RUN — только показать правила, не применять?" "$([[ ${DRY_RUN:-0} == 1 ]] && echo y || echo n)"
     PARAM_DRY_RUN="$YN"
 
     # Итоговый summary
@@ -151,7 +152,7 @@ ask_protect_params() {
     yn "Всё верно, продолжить?" "y"
     if [[ "$YN" == "0" ]]; then
         info "Отменено. Запускай заново."
-        exit 0
+        return 1
     fi
 }
 
@@ -170,29 +171,51 @@ run_protect() {
 }
 
 show_menu() {
-    show_banner
-    echo -e "  Выбери действие:\n"
-    echo -e "  ${BOLD}1)${NC} 🛡  Установить защиту"
-    echo -e "  ${BOLD}2)${NC} 🩺  Статус"
-    echo -e "  ${BOLD}3)${NC} ↩   Откат"
-    echo -e "  ${BOLD}q)${NC}     Выход"
-    echo ""
-    echo -n "  Выбор: "
-    read -r CHOICE
-
-    case "$CHOICE" in
-        1) run_protect ;;
-        2) bash "${SCRIPT_DIR}/scripts/status.sh" ;;
-        3) bash "${SCRIPT_DIR}/scripts/rollback.sh" ;;
-        q|Q) exit 0 ;;
-        *) echo "Неверный выбор"; show_menu ;;
-    esac
+    local choice
+    while true; do
+        show_banner
+        printf '  %b1%b  Настроить защиту\n' "$BOLD" "$NC"
+        printf '  %b2%b  Проверить статус\n' "$BOLD" "$NC"
+        printf '  %b3%b  Удалить защиту\n' "$BOLD" "$NC"
+        printf '  %b4%b  Обновить скрипт\n' "$BOLD" "$NC"
+        printf '  %b5%b  Подтвердить применение\n' "$BOLD" "$NC"
+        printf '\n  %b0%b  Выйти\n\n' "$BOLD" "$NC"
+        printf '  Выберите действие: '
+        read -r choice || return 0
+        case "$choice" in
+            1) bash "$SCRIPT_DIR/install.sh" --configure || info "Настройка не завершена." ;;
+            2) bash "$SCRIPT_DIR/scripts/status.sh" || info "Не удалось получить полный статус." ;;
+            3)
+                printf '  Удалить защиту? [y/N]: '
+                read -r choice || return 0
+                if [[ "${choice,,}" == y ]]; then
+                    bash "$SCRIPT_DIR/scripts/rollback.sh" || info "Удаление не завершено."
+                fi
+                ;;
+            4)
+                if bash "$SCRIPT_DIR/scripts/update.sh"; then
+                    cd "$SCRIPT_DIR"
+                    exec bash "$SCRIPT_DIR/install.sh"
+                else
+                    info "Обновление не выполнено."
+                fi
+                ;;
+            5) bash "$SCRIPT_DIR/scripts/confirm.sh" || info "Применение не подтверждено." ;;
+            0|q|Q) printf '\n  До встречи :3\n'; return 0 ;;
+            *) info "Введите номер от 0 до 5."; continue ;;
+        esac
+        printf '\n  Enter — вернуться в меню…'
+        read -r choice || return 0
+    done
 }
 
 CMD="${1:-}"
 
 case "$CMD" in
-    protect)   run_protect ;;
+    --configure) run_protect ;;
+    update)    bash "$SCRIPT_DIR/scripts/update.sh" ;;
+    protect)   bash "${SCRIPT_DIR}/scripts/protect.sh" "${@:2}" ;;
+    confirm)   bash "${SCRIPT_DIR}/scripts/confirm.sh" ;;
     rollback)  bash "${SCRIPT_DIR}/scripts/rollback.sh" ;;
     status)    bash "${SCRIPT_DIR}/scripts/status.sh" ;;
     --help|-h) show_help ;;

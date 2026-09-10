@@ -1,138 +1,66 @@
 #!/bin/bash
-# ufw-antiscan/scripts/rollback.sh
-# Откат всех изменений, внесённых protect.sh
-
-set -euo pipefail
-
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-
-info()    { echo -e "${CYAN}[*]${NC} $*"; }
-ok()      { echo -e "${GREEN}[✔]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
-err()     { echo -e "${RED}[✘]${NC} $*" >&2; exit 1; }
-section() { echo -e "\n${BOLD}━━━ $* ━━━${NC}"; }
-
-[[ $EUID -ne 0 ]] && err "Нужен root: sudo bash $0"
-
-MARKER_START="# === UFW-ANTISCAN START ==="
-MARKER_END="# === UFW-ANTISCAN END ==="
-
-section "Откат ufw-antiscan"
-
-# ── Удаляем правила из before.rules ──────────────────────────────────────────
-remove_block() {
-    local FILE="$1"
-    if [[ ! -f "$FILE" ]]; then return; fi
-
-    if grep -q "UFW-ANTISCAN START" "$FILE" 2>/dev/null; then
-        python3 -c "
-import re
-with open('${FILE}', 'r') as f:
-    c = f.read()
-c = re.sub(r'\n?# === UFW-ANTISCAN START ===.*?# === UFW-ANTISCAN END ===\n?', '\n', c, flags=re.DOTALL)
-with open('${FILE}', 'w') as f:
-    f.write(c)
-"
-        ok "Блок правил удалён из ${FILE}"
-    else
-        info "Блок не найден в ${FILE} — пропускаю"
-    fi
+# Uninstall owned rules; preserve unrelated UFW edits and pre-existing services.
+set -Eeuo pipefail
+export LC_ALL=C
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/state.sh"
+[[ $EUID == 0 ]] || { echo 'Run as root' >&2; exit 1; }
+[[ "${PURGE_CROWDSEC:-0}" == 0 ]] || {
+    echo 'Automatic CrowdSec purge is no longer supported. Remove it separately if needed.' >&2
+    exit 1
 }
-
-remove_block /etc/ufw/before.rules
-remove_block /etc/ufw/before6.rules
-
-# ── Удаляем fail2ban jail ─────────────────────────────────────────────────────
-section "fail2ban"
-
-F2B_JAIL="/etc/fail2ban/jail.d/ufw-antiscan-ssh.conf"
-if [[ -f "$F2B_JAIL" ]]; then
-    rm -f "$F2B_JAIL"
-    ok "fail2ban SSH jail удалён"
-    systemctl restart fail2ban 2>/dev/null || true
-else
-    info "fail2ban jail не найден — пропускаю"
-fi
-
-# ── Сброс portscan-банов ──────────────────────────────────────────────────────
-section "Portscan-баны"
-
-if [[ -f /proc/net/ipt_recent/PORTSCANNERS ]]; then
-    echo / > /proc/net/ipt_recent/PORTSCANNERS
-    ok "Список PORTSCANNERS очищен"
-else
-    info "Список PORTSCANNERS не найден — пропускаю"
-fi
-
-# ── Blocklists (ipset) ───────────────────────────────────────────────────────
-section "Blocklists (ipset)"
-
-# Останавливаем таймер
-if systemctl is-active ufw-antiscan-blocklists.timer &>/dev/null 2>&1; then
-    systemctl disable --now ufw-antiscan-blocklists.timer 2>/dev/null || true
-    ok "Systemd-таймер остановлен"
-fi
-
-# Удаляем unit-файлы
-for F in /etc/systemd/system/ufw-antiscan-blocklists.{service,timer}; do
-    [[ -f "$F" ]] && rm -f "$F" && ok "Удалён: $F"
+exec 9>/run/lock/ufw-antiscan.lock
+flock -n 9 || { echo 'Another AntiScan operation is running' >&2; exit 1; }
+[[ -d "$STATE/original" ]] || {
+    echo 'No installation snapshot. Legacy installations require manual rollback from their backup.' >&2
+    exit 1
+}
+# Keep an emergency snapshot before stopping services.
+BACKUP=$(mktemp -d /var/backups/ufw-antiscan/uninstall.XXXXXXXX)
+snapshot "$BACKUP"
+rollback_error() {
+    local code=$?
+    trap - ERR
+    flock -u 8 2>/dev/null || true
+    restore_snapshot "$BACKUP" || echo "Restore failed: $BACKUP" >&2
+    if [[ -f "$PENDING" ]]; then
+        arm_safety "$(cat "$PENDING")" 180 || echo 'Failed to rearm recovery timer' >&2
+    fi
+    exit "$code"
+}
+trap rollback_error ERR
+systemctl stop ufw-antiscan-safety.timer ufw-antiscan-safety.service 2>/dev/null || true
+systemctl stop ufw-antiscan-blocklists.timer ufw-antiscan-blocklists.service 2>/dev/null || true
+for family in 4 6; do
+    name=before.rules; restore=iptables-restore
+    if [[ $family == 6 ]]; then name=before6.rules; restore=ip6tables-restore; fi
+    [[ -f "/etc/ufw/$name" ]] || continue
+    cp -a "/etc/ufw/$name" "$BACKUP/$name"
+    python3 "$SCRIPT_DIR/rules.py" remove "$BACKUP/$name"
+    "$restore" --test < "$BACKUP/$name"
 done
-systemctl daemon-reload 2>/dev/null || true
-
-# Удаляем ipset-сеты
-for SET in ANTISCAN-V4 ANTISCAN-V6 ANTISCAN-V4-TMP ANTISCAN-V6-TMP; do
-    if ipset list "$SET" &>/dev/null 2>&1; then
-        ipset flush "$SET" 2>/dev/null || true
-        ipset destroy "$SET" 2>/dev/null && ok "ipset сет удалён: $SET" || true
-    fi
+for name in before.rules before6.rules; do
+    [[ -f "$BACKUP/$name" ]] || continue
+    cp -a "$BACKUP/$name" "/etc/ufw/$name.antiscan-new"
+    mv -f "/etc/ufw/$name.antiscan-new" "/etc/ufw/$name"
 done
-
-# Удаляем скрипт и конфиг
-[[ -f /usr/local/bin/ufw-antiscan-update-blocklists.sh ]] &&     rm -f /usr/local/bin/ufw-antiscan-update-blocklists.sh &&     ok "Скрипт обновления удалён"
-[[ -d /etc/ufw-antiscan ]] &&     rm -rf /etc/ufw-antiscan &&     ok "Конфиг /etc/ufw-antiscan удалён"
-
-# ── CrowdSec ──────────────────────────────────────────────────────────────────
-section "CrowdSec"
-
-PURGE_CROWDSEC="${PURGE_CROWDSEC:-0}"
-
-if [[ "$PURGE_CROWDSEC" == "1" ]]; then
-    warn "PURGE_CROWDSEC=1 — удаляю CrowdSec полностью"
-    systemctl stop crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
-    apt-get remove -y crowdsec crowdsec-firewall-bouncer-iptables 2>/dev/null || true
-    rm -rf /etc/crowdsec /var/lib/crowdsec
-    ok "CrowdSec удалён"
-else
-    info "CrowdSec оставлен (удалить: PURGE_CROWDSEC=1 bash scripts/rollback.sh)"
-    if command -v cscli &>/dev/null; then
-        systemctl stop crowdsec-firewall-bouncer 2>/dev/null || true
-        ok "CrowdSec bouncer остановлен (агент продолжает работать)"
-    fi
-fi
-
-# ── Восстановление из бэкапа ──────────────────────────────────────────────────
-section "Бэкап"
-
-LATEST_BACKUP=$(ls -dt /var/backups/ufw-antiscan/*/ 2>/dev/null | head -1 || true)
-if [[ -n "$LATEST_BACKUP" ]]; then
-    info "Найден бэкап: ${LATEST_BACKUP}"
-    echo -n "Восстановить before.rules из бэкапа? [y/N] "
-    read -r ANSWER
-    if [[ "${ANSWER,,}" == "y" ]]; then
-        cp "${LATEST_BACKUP}/before.rules.bak"  /etc/ufw/before.rules
-        [[ -f "${LATEST_BACKUP}/before6.rules.bak" ]] && \
-            cp "${LATEST_BACKUP}/before6.rules.bak" /etc/ufw/before6.rules
-        ok "Файлы восстановлены из бэкапа"
-    fi
-else
-    info "Бэкапы не найдены"
-fi
-
-# ── UFW reload ────────────────────────────────────────────────────────────────
 ufw reload
-ok "UFW перезагружен"
-
-echo ""
-echo -e "${GREEN}${BOLD}✔ Откат завершён${NC}"
-echo ""
+remove_private_chains
+# Only now are there no active references to our sets.
+restore_files "$STATE/original" uninstall
+restore_services "$STATE/original"
+exec 8>/run/lock/ufw-antiscan-blocklists.lock
+flock -x 8
+if command -v ipset >/dev/null; then
+    for name in ANTISCAN-V4 ANTISCAN-V6 ANTISCAN-V4-TMP ANTISCAN-V6-TMP; do
+        if ipset list "$name" >/dev/null 2>&1; then
+            ipset destroy "$name"
+        fi
+    done
+fi
+rm -f "$PENDING"
+mv "$STATE/original" "$BACKUP/original"
+trap - ERR
+rm -rf /usr/local/lib/ufw-antiscan
+echo "AntiScan removed. Pre-existing services restored. Backup: $BACKUP"
+echo 'Installed packages were retained; unrelated UFW rules were preserved.'
