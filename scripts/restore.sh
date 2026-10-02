@@ -8,4 +8,5 @@ flock -x 9
 BACKUP=$(cat "$PENDING")
 restore_snapshot "$BACKUP"
 rm -f "$PENDING"
+disarm_safety
 echo "AntiScan: unconfirmed changes restored from $BACKUP"

@@ -51,8 +51,7 @@ from pathlib import Path
 root = Path(sys.argv[1])
 required = ['install.sh', 'scripts/update.sh', 'scripts/protect.sh', 'scripts/status.sh',
             'scripts/rollback.sh', 'scripts/confirm.sh', 'scripts/restore.sh',
-            'scripts/state.sh', 'scripts/rules.py', 'scripts/update-blocklists.sh',
-            'scripts/ensure-ipsets.sh']
+            'scripts/state.sh', 'scripts/basic.sh', 'scripts/rules.py']
 for name in required:
     path = root / name
     if not path.is_file() or path.is_symlink() or root.resolve() not in path.resolve().parents:

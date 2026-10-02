@@ -26,8 +26,10 @@ fi
 UFW_STATUS=$(ufw status 2>/dev/null | head -1 || true)
 if [[ "$UFW_STATUS" == "Status: active" ]]; then
     ok "UFW активен"
+elif grep -q "UFW-ANTISCAN START" /etc/ufw/before.rules 2>/dev/null; then
+    bad "UFW неактивен при установленных Experimental-правилах"
 else
-    bad "UFW неактивен! Включи: sudo ufw enable"
+    warn "UFW неактивен; для режима Basic он не обязателен"
 fi
 
 if grep -q "UFW-ANTISCAN START" /etc/ufw/before.rules 2>/dev/null; then
@@ -42,7 +44,32 @@ if grep -q "UFW-ANTISCAN START" /etc/ufw/before.rules 2>/dev/null; then
         bad "Цепочка IPv4 не загружена"
     fi
 else
-    bad "Правила ufw-antiscan НЕ установлены"
+    warn "Experimental-правила не установлены"
+fi
+
+# ── SSH Basic ─────────────────────────────────────────────────────────────────
+section "SSH Basic"
+SSH_DROPIN=/etc/ssh/sshd_config.d/00-remnanode-antiscan.conf
+if [[ -f "$SSH_DROPIN" ]]; then
+    ok "Управляемая SSH-конфигурация установлена"
+    SSHD=$(command -v sshd 2>/dev/null || true)
+    [[ -n "$SSHD" ]] || [[ ! -x /usr/sbin/sshd ]] || SSHD=/usr/sbin/sshd
+    if [[ -n "$SSHD" ]]; then
+        EFFECTIVE=$("$SSHD" -T 2>/dev/null || true)
+        PUBKEY=$(awk '$1=="pubkeyauthentication"{print $2}' <<< "$EFFECTIVE")
+        PASSWORD=$(awk '$1=="passwordauthentication"{print $2}' <<< "$EFFECTIVE")
+        KBD=$(awk '$1=="kbdinteractiveauthentication"{print $2}' <<< "$EFFECTIVE")
+        echo "    PubkeyAuthentication:       ${PUBKEY:-?}"
+        echo "    PasswordAuthentication:     ${PASSWORD:-?}"
+        echo "    KbdInteractiveAuthentication: ${KBD:-?}"
+        [[ "$PUBKEY" == yes && "$PASSWORD" == no && "$KBD" == no ]] \
+            && ok "Вход по ключу включён, парольные методы отключены" \
+            || warn "Эффективная конфигурация SSH отличается от ожидаемой"
+    else
+        bad "sshd не найден"
+    fi
+else
+    warn "Basic не управляет парольной аутентификацией SSH"
 fi
 
 # ── Portscan-баны ─────────────────────────────────────────────────────────────
@@ -50,49 +77,28 @@ section "AntiScan (ipt_recent)"
 
 RECENT_FILE=/proc/net/xt_recent/PORTSCANNERS
 [[ -r "$RECENT_FILE" ]] || RECENT_FILE=/proc/net/ipt_recent/PORTSCANNERS
-if [[ -r "$RECENT_FILE" ]]; then
-    SCAN_COUNT=$(wc -l < "$RECENT_FILE")
-    if [[ "$SCAN_COUNT" -gt 0 ]]; then
-        warn "Записей recent (включая истёкшие): ${SCAN_COUNT}"
-        echo ""
-        echo -e "  ${BOLD}Последние 10 забаненных IP:${NC}"
-        awk '{
-            for(i=1;i<=NF;i++){
-                if($i ~ /^src=/) { gsub("src=","",$i); printf "    %s\n",$i }
-            }
-        }' "$RECENT_FILE" 2>/dev/null | tail -10
+PORTSCAN_ENABLED=0
+if iptables -S ufw-antiscan 2>/dev/null | grep -q PORTSCANNERS; then
+    PORTSCAN_ENABLED=1
+    if [[ ! -r "$RECENT_FILE" ]]; then
+        warn "Portscan autoban включён, но таблица xt_recent недоступна"
     else
-        ok "Активных portscan-банов нет"
+        SCAN_COUNT=$(wc -l < "$RECENT_FILE")
+        if [[ "$SCAN_COUNT" -gt 0 ]]; then
+            warn "Записей recent (включая истёкшие): ${SCAN_COUNT}"
+            echo ""
+            echo -e "  ${BOLD}Последние 10 забаненных IP:${NC}"
+            awk '{
+                for(i=1;i<=NF;i++){
+                    if($i ~ /^src=/) { gsub("src=","",$i); printf "    %s\n",$i }
+                }
+            }' "$RECENT_FILE" 2>/dev/null | tail -10
+        else
+            ok "Активных portscan-банов нет"
+        fi
     fi
 else
-    warn "Модуль ipt_recent не активен (правила ещё не применялись?)"
-fi
-
-# ── Blocklists (ipset) ───────────────────────────────────────────────────────
-section "Blocklists (ipset)"
-
-if command -v ipset &>/dev/null; then
-    V4_COUNT=$(ipset list ANTISCAN-V4 2>/dev/null | awk '/^Number of entries:/ {n=$4} END {print n+0}' || true)
-    V6_COUNT=$(ipset list ANTISCAN-V6 2>/dev/null | awk '/^Number of entries:/ {n=$4} END {print n+0}' || true)
-
-    if [[ "$V4_COUNT" -gt 0 || "$V6_COUNT" -gt 0 ]]; then
-        ok "ipset активен: IPv4=${V4_COUNT} подсетей, IPv6=${V6_COUNT} подсетей"
-    else
-        warn "ipset сеты пусты или не созданы"
-    fi
-
-    if systemctl is-active ufw-antiscan-blocklists.timer &>/dev/null; then
-        NEXT=$(systemctl status ufw-antiscan-blocklists.timer 2>/dev/null             | awk '/Trigger:/{print $2,$3}' || echo '?')
-        ok "Таймер обновления активен, следующий запуск: ${NEXT}"
-    else
-        warn "Таймер обновления не активен (sudo systemctl start ufw-antiscan-blocklists.timer)"
-    fi
-
-    # Последнее обновление
-    LAST=$(journalctl -u ufw-antiscan-blocklists.service --no-pager -n 1 2>/dev/null         | awk '{print $1,$2,$3}' || echo '?')
-    echo "  Последнее обновление: ${LAST}"
-else
-    warn "ipset не установлен (blocklists не активны)"
+    warn "Portscan autoban не включён"
 fi
 
 # ── fail2ban ──────────────────────────────────────────────────────────────────
@@ -112,7 +118,7 @@ if command -v fail2ban-client &>/dev/null; then
         bad "fail2ban не запущен"
     fi
 else
-    bad "fail2ban не установлен"
+    warn "Fail2Ban не установлен (опционально)"
 fi
 
 # ── CrowdSec ──────────────────────────────────────────────────────────────────
@@ -153,11 +159,11 @@ ufw status numbered 2>/dev/null | sed -n '/./{p;}' | sed -n '1,30p' || warn "Н�
 
 echo ""
 echo -e "${BOLD}Команды управления:${NC}"
-echo "  Разбанить portscan-IP:    echo -<IP> > ${RECENT_FILE}"
-echo "  Разбанить всех сканеров:  echo / > ${RECENT_FILE}"
-echo "  Разбанить SSH (fail2ban): fail2ban-client unban <IP>"
+if [[ "$PORTSCAN_ENABLED" == 1 ]]; then
+    echo "  Разбанить portscan-IP:    echo -<IP> > ${RECENT_FILE}"
+    echo "  Разбанить всех сканеров:  echo / > ${RECENT_FILE}"
+fi
+echo "  Разбанить SSH (Fail2Ban): fail2ban-client set sshd unbanip <IP>"
 echo "  Разбанить (CrowdSec):     cscli decisions delete --ip <IP>"
 echo "  Откат:                    sudo bash install.sh rollback"
-echo "  Обновить blocklists:      systemctl start ufw-antiscan-blocklists"
-echo "  Логи обновления:          journalctl -u ufw-antiscan-blocklists -f"
 echo ""

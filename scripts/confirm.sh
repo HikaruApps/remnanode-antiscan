@@ -13,6 +13,41 @@ if [[ -s "$BACKUP/ssh-connection" ]]; then
         exit 1
     }
 fi
-systemctl stop ufw-antiscan-safety.timer
+if [[ -s "$BACKUP/require-new-after" ]]; then
+    command -v python3 >/dev/null || { echo 'python3 is required to verify the SSH session age.' >&2; exit 1; }
+    mapfile -t boundary < "$BACKUP/require-new-after"
+    [[ ${#boundary[@]} == 2 ]] || { echo 'Invalid SSH confirmation boundary.' >&2; exit 1; }
+    python3 - "${boundary[0]}" "${boundary[1]}" <<'PY'
+import os
+import sys
+
+required_boot_id = sys.argv[1]
+required_ns = int(sys.argv[2])
+current_boot_id = open('/proc/sys/kernel/random/boot_id').read().strip()
+if current_boot_id != required_boot_id:
+    raise SystemExit('The server rebooted after protection was applied; allow the pending safety rollback to run.')
+pid = os.getppid()
+found = False
+while pid > 1:
+    try:
+        comm = open(f'/proc/{pid}/comm').read().strip()
+        raw = open(f'/proc/{pid}/stat').read()
+        fields = raw.rsplit(')', 1)[1].split()
+        parent = int(fields[1])
+        start_ticks = int(fields[19])
+    except (FileNotFoundError, IndexError, ValueError):
+        break
+    if comm in {'sshd', 'sshd-session'}:
+        started_ns = start_ticks * 1_000_000_000 // os.sysconf('SC_CLK_TCK')
+        if started_ns <= required_ns:
+            raise SystemExit('This SSH session existed before protection was applied; open a fresh connection.')
+        found = True
+        break
+    pid = parent
+if not found:
+    raise SystemExit('Could not verify a fresh sshd session.')
+PY
+fi
 rm -f "$PENDING"
+disarm_safety
 echo 'Application confirmed; automatic rollback cancelled'
