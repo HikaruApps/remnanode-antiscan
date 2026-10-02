@@ -72,6 +72,56 @@ else
     warn "Basic не управляет парольной аутентификацией SSH"
 fi
 
+# ── Kernel/network tuning ────────────────────────────────────────────────────
+section "BBR + CAKE / IPv6"
+BBR_SYSCTL=/etc/sysctl.d/99-remnanode-antiscan-bbr-cake.conf
+IPV6_SYSCTL=/etc/sysctl.d/99-remnanode-antiscan-ipv6.conf
+TCP_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unavailable)
+DEFAULT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unavailable)
+echo "    TCP congestion control: ${TCP_CC}"
+echo "    Default qdisc:          ${DEFAULT_QDISC}"
+if [[ "$TCP_CC" == bbr && "$DEFAULT_QDISC" == cake ]]; then
+    ok "BBR включён, CAKE выбран как default qdisc"
+elif [[ -f "$BBR_SYSCTL" ]]; then
+    bad "Конфиг BBR + CAKE установлен, но эффективные значения отличаются"
+else
+    warn "BBR + CAKE не управляются AntiScan"
+fi
+if command -v tc >/dev/null; then
+    CAKE_ACTIVE=$(tc qdisc show 2>/dev/null | grep -c 'qdisc cake ' || true)
+    if [[ "$CAKE_ACTIVE" -gt 0 ]]; then
+        ok "CAKE активен как минимум на ${CAKE_ACTIVE} qdisc"
+    elif [[ "$DEFAULT_QDISC" == cake ]]; then
+        warn "CAKE задан по умолчанию, но ещё не виден на активных интерфейсах; может потребоваться reboot"
+    fi
+fi
+
+if [[ -d /proc/sys/net/ipv6/conf ]]; then
+    IPV6_ENABLED=0
+    IPV6_DISABLED=0
+    for IPV6_PATH in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+        [[ -f "$IPV6_PATH" ]] || continue
+        IPV6_IFACE=${IPV6_PATH%/disable_ipv6}
+        IPV6_IFACE=${IPV6_IFACE##*/}
+        [[ "$IPV6_IFACE" != all && "$IPV6_IFACE" != default ]] || continue
+        if [[ "$(cat "$IPV6_PATH")" == 0 ]]; then
+            IPV6_ENABLED=$((IPV6_ENABLED + 1))
+        else
+            IPV6_DISABLED=$((IPV6_DISABLED + 1))
+        fi
+    done
+    if [[ "$IPV6_DISABLED" == 0 ]]; then
+        ok "IPv6 включён на существующих интерфейсах"
+    elif [[ "$IPV6_ENABLED" == 0 ]]; then
+        ok "IPv6 отключён на существующих интерфейсах"
+    else
+        warn "Состояние IPv6 смешанное: включено ${IPV6_ENABLED}, отключено ${IPV6_DISABLED} интерфейсов"
+    fi
+    [[ ! -f "$IPV6_SYSCTL" ]] || ok "Состояние IPv6 управляется AntiScan"
+else
+    warn "IPv6 отсутствует или отключён параметром ядра"
+fi
+
 # ── Portscan-баны ─────────────────────────────────────────────────────────────
 section "AntiScan (ipt_recent)"
 

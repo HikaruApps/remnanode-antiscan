@@ -36,6 +36,7 @@ ufw-antiscan — защита от сканеров и флуда поверх U
 Команды:
   basic      Basic: SSH-ключ, безопасное отключение пароля, Fail2Ban/CrowdSec
   protect    Experimental: настраиваемые firewall-правила + Fail2Ban/CrowdSec
+  tuning     Дополнительные настройки: BBR + CAKE и состояние IPv6
   confirm    Подтвердить применение из нового SSH-подключения
   rollback   Удалить защиту и восстановить прежние настройки
   status     Показать текущий статус защиты
@@ -68,6 +69,10 @@ ENV для команды protect (Experimental):
   CROWDSEC_ENROLL_KEY   Ключ из app.crowdsec.net (опционально)
   DRY_RUN               1 — показать правила без применения
 
+ENV для команды tuning apply:
+  ENABLE_BBR_CAKE       1 — включить BBR + CAKE; 0 — не менять
+  IPV6_MODE             keep/enable/disable — не менять, включить или отключить IPv6
+
   SAFETY_TIMER          Время на подтверждение (по умолч.: 180 секунд)
 
 Примеры:
@@ -76,6 +81,8 @@ ENV для команды protect (Experimental):
        WHITELIST="1.2.3.4" bash install.sh protect
 
   sudo DRY_RUN=1 ENABLE_BAD_TCP_FLAGS=1 bash install.sh protect
+  sudo --preserve-env=SSH_CONNECTION ENABLE_BBR_CAKE=1 IPV6_MODE=keep \
+       bash install.sh tuning apply
   sudo --preserve-env=SSH_CONNECTION bash install.sh confirm
 HELP
 }
@@ -350,6 +357,68 @@ run_basic() {
         bash "$SCRIPT_DIR/scripts/basic.sh" apply
 }
 
+run_tuning() {
+    local ipv6_default ipv6_choice current_cc current_qdisc current_ipv6
+    echo ""
+    echo -e "  ${BOLD}Дополнительные настройки${NC}"
+    echo -e "  ${YELLOW}Каждая функция применяется только после явного выбора.${NC}"
+    echo ""
+
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')
+    current_ipv6=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo '?')
+    [[ "$current_ipv6" != 0 ]] || current_ipv6="включён"
+    [[ "$current_ipv6" != 1 ]] || current_ipv6="отключён"
+    echo "  Сейчас: TCP=${current_cc}, default qdisc=${current_qdisc}, IPv6=${current_ipv6}"
+    echo ""
+
+    yn "Включить BBR + CAKE?" "$([[ ${ENABLE_BBR_CAKE:-0} == 1 ]] && echo y || echo n)"
+    PARAM_BBR_CAKE="$YN"
+    if [[ "$PARAM_BBR_CAKE" == 1 ]]; then
+        warn "CAKE станет default qdisc; активный интерфейс подхватит его после reboot или пересоздания."
+    fi
+
+    case "${IPV6_MODE:-keep}" in
+        enable) ipv6_default=1 ;;
+        disable) ipv6_default=2 ;;
+        *) ipv6_default=0 ;;
+    esac
+    echo ""
+    echo "  IPv6: 0 — не менять, 1 — включить, 2 — отключить"
+    ask "Действие с IPv6" "$ipv6_default"
+    ipv6_choice="$REPLY"
+    case "$ipv6_choice" in
+        0) PARAM_IPV6_MODE=keep ;;
+        1) PARAM_IPV6_MODE=enable ;;
+        2) PARAM_IPV6_MODE=disable ;;
+        *) warn "Введите 0, 1 или 2."; return 1 ;;
+    esac
+    if [[ "$PARAM_IPV6_MODE" == disable ]]; then
+        warn "Отключение IPv6 удалит IPv6-адреса и маршруты со всех интерфейсов."
+        warn "Из текущей SSH-сессии по IPv6 это действие будет запрещено."
+    fi
+
+    if [[ "$PARAM_BBR_CAKE" == 0 && "$PARAM_IPV6_MODE" == keep ]]; then
+        ok "Дополнительные настройки не изменены."
+        return 0
+    fi
+
+    ask "Время safety-таймера, секунд" "${SAFETY_TIMER:-180}"
+    PARAM_SAFETY_TIMER="$REPLY"
+    echo ""
+    echo -e "  ┌─ ${BOLD}Итоговые параметры${NC} ─────────────────────────"
+    echo -e "  │  BBR + CAKE: ${CYAN}${PARAM_BBR_CAKE}${NC}"
+    echo -e "  │  IPv6:       ${CYAN}${PARAM_IPV6_MODE}${NC}"
+    echo -e "  │  Safety:     ${CYAN}${PARAM_SAFETY_TIMER}s${NC}"
+    echo -e "  └──────────────────────────────────────────"
+    echo ""
+    yn "Применить дополнительные настройки?" "n"
+    [[ "$YN" == 1 ]] || { info "Применение отменено."; return 0; }
+
+    ENABLE_BBR_CAKE="$PARAM_BBR_CAKE" IPV6_MODE="$PARAM_IPV6_MODE" \
+    SAFETY_TIMER="$PARAM_SAFETY_TIMER" bash "$SCRIPT_DIR/scripts/tuning.sh" apply
+}
+
 show_protect_menu() {
     local choice
     echo ""
@@ -373,24 +442,26 @@ show_menu() {
     while true; do
         show_banner
         printf '  %b1%b  Protect — Basic / Experimental\n' "$BOLD" "$NC"
-        printf '  %b2%b  Проверить статус\n' "$BOLD" "$NC"
-        printf '  %b3%b  Удалить защиту\n' "$BOLD" "$NC"
-        printf '  %b4%b  Обновить скрипт\n' "$BOLD" "$NC"
-        printf '  %b5%b  Подтвердить применение\n' "$BOLD" "$NC"
+        printf '  %b2%b  Доп. настройки — BBR + CAKE / IPv6\n' "$BOLD" "$NC"
+        printf '  %b3%b  Проверить статус\n' "$BOLD" "$NC"
+        printf '  %b4%b  Удалить защиту\n' "$BOLD" "$NC"
+        printf '  %b5%b  Обновить скрипт\n' "$BOLD" "$NC"
+        printf '  %b6%b  Подтвердить применение\n' "$BOLD" "$NC"
         printf '\n  %b0%b  Выйти\n\n' "$BOLD" "$NC"
         printf '  Выберите действие: '
         read -r choice || return 0
         case "$choice" in
             1) show_protect_menu || info "Настройка не завершена." ;;
-            2) bash "$SCRIPT_DIR/scripts/status.sh" || info "Не удалось получить полный статус." ;;
-            3)
+            2) run_tuning || info "Дополнительные настройки не завершены." ;;
+            3) bash "$SCRIPT_DIR/scripts/status.sh" || info "Не удалось получить полный статус." ;;
+            4)
                 printf '  Удалить защиту? [y/N]: '
                 read -r choice || return 0
                 if [[ "${choice,,}" == y ]]; then
                     bash "$SCRIPT_DIR/scripts/rollback.sh" || info "Удаление не завершено."
                 fi
                 ;;
-            4)
+            5)
                 if bash "$SCRIPT_DIR/scripts/update.sh"; then
                     cd "$SCRIPT_DIR"
                     exec bash "$SCRIPT_DIR/install.sh"
@@ -398,9 +469,9 @@ show_menu() {
                     info "Обновление не выполнено."
                 fi
                 ;;
-            5) bash "$SCRIPT_DIR/scripts/confirm.sh" || info "Применение не подтверждено." ;;
+            6) bash "$SCRIPT_DIR/scripts/confirm.sh" || info "Применение не подтверждено." ;;
             0|q|Q) printf '\n  До встречи :3\n'; return 0 ;;
-            *) info "Введите номер от 0 до 5."; continue ;;
+            *) info "Введите номер от 0 до 6."; continue ;;
         esac
         printf '\n  Enter — вернуться в меню…'
         read -r choice || return 0
@@ -413,6 +484,9 @@ case "$CMD" in
     --configure) run_experimental ;;
     basic)
         if [[ -z ${2:-} ]]; then run_basic; else bash "${SCRIPT_DIR}/scripts/basic.sh" "${@:2}"; fi
+        ;;
+    tuning)
+        if [[ -z ${2:-} ]]; then run_tuning; else bash "${SCRIPT_DIR}/scripts/tuning.sh" "${@:2}"; fi
         ;;
     update)    bash "$SCRIPT_DIR/scripts/update.sh" ;;
     protect)   bash "${SCRIPT_DIR}/scripts/protect.sh" "${@:2}" ;;

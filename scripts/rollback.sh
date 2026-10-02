@@ -13,7 +13,10 @@ exec 9>/run/lock/ufw-antiscan.lock
 flock -n 9 || { echo 'Another AntiScan operation is running' >&2; exit 1; }
 FIREWALL_ORIGINAL="$STATE/original"
 BASIC_ORIGINAL="$STATE/basic-original"
-[[ -d "$FIREWALL_ORIGINAL" || -d "$BASIC_ORIGINAL" ]] || {
+TUNING_BBR_ORIGINAL="$STATE/tuning-bbr-original"
+TUNING_IPV6_ORIGINAL="$STATE/tuning-ipv6-original"
+[[ -d "$FIREWALL_ORIGINAL" || -d "$BASIC_ORIGINAL" || \
+   -d "$TUNING_BBR_ORIGINAL" || -d "$TUNING_IPV6_ORIGINAL" ]] || {
     echo 'No installation snapshot. Legacy installations require manual rollback from their backup.' >&2
     exit 1
 }
@@ -21,6 +24,11 @@ BASIC_ORIGINAL="$STATE/basic-original"
 BACKUP=$(mktemp -d /var/backups/ufw-antiscan/uninstall.XXXXXXXX)
 if [[ -d "$FIREWALL_ORIGINAL" ]]; then snapshot "$BACKUP/firewall-current" firewall; fi
 if [[ -d "$BASIC_ORIGINAL" ]]; then snapshot "$BACKUP/basic-current" basic; fi
+if [[ -d "$TUNING_BBR_ORIGINAL" || -d "$TUNING_IPV6_ORIGINAL" ]]; then
+    snapshot "$BACKUP/tuning-current" tuning
+    [[ ! -d "$TUNING_BBR_ORIGINAL" ]] || : > "$BACKUP/tuning-current/restore-bbr"
+    [[ ! -d "$TUNING_IPV6_ORIGINAL" ]] || : > "$BACKUP/tuning-current/restore-ipv6"
+fi
 rollback_error() {
     local code=$?
     trap - ERR
@@ -30,6 +38,9 @@ rollback_error() {
     fi
     if [[ -d "$BACKUP/basic-current" ]]; then
         restore_snapshot "$BACKUP/basic-current" || echo "Basic restore failed: $BACKUP" >&2
+    fi
+    if [[ -d "$BACKUP/tuning-current" ]]; then
+        restore_snapshot "$BACKUP/tuning-current" || echo "Tuning restore failed: $BACKUP" >&2
     fi
     if [[ -f "$PENDING" ]]; then
         arm_safety "$(cat "$PENDING")" 180 || echo 'Failed to rearm recovery timer' >&2
@@ -82,10 +93,12 @@ if [[ -d "$FIREWALL_ORIGINAL" && -d "$BASIC_ORIGINAL" ]]; then
     fi
 elif [[ -d "$FIREWALL_ORIGINAL" ]]; then
     restore_owned "$FIREWALL_ORIGINAL"
-else
+elif [[ -d "$BASIC_ORIGINAL" ]]; then
     restore_owned "$BASIC_ORIGINAL"
 fi
 [[ "$ssh_changed" == 0 ]] || reload_ssh
+[[ ! -d "$TUNING_BBR_ORIGINAL" ]] || restore_snapshot "$TUNING_BBR_ORIGINAL"
+[[ ! -d "$TUNING_IPV6_ORIGINAL" ]] || restore_snapshot "$TUNING_IPV6_ORIGINAL"
 
 # Only now are there no active references to legacy sets.
 if [[ -d "$FIREWALL_ORIGINAL" ]]; then
@@ -101,8 +114,10 @@ rm -f "$PENDING"
 disarm_safety
 [[ ! -d "$FIREWALL_ORIGINAL" ]] || mv "$FIREWALL_ORIGINAL" "$BACKUP/original"
 [[ ! -d "$BASIC_ORIGINAL" ]] || mv "$BASIC_ORIGINAL" "$BACKUP/basic-original"
+[[ ! -d "$TUNING_BBR_ORIGINAL" ]] || mv "$TUNING_BBR_ORIGINAL" "$BACKUP/tuning-bbr-original"
+[[ ! -d "$TUNING_IPV6_ORIGINAL" ]] || mv "$TUNING_IPV6_ORIGINAL" "$BACKUP/tuning-ipv6-original"
 trap - ERR
 rm -rf /usr/local/lib/ufw-antiscan
-echo "AntiScan removed. SSH settings and pre-existing services restored. Backup: $BACKUP"
+echo "AntiScan removed. SSH, kernel/network settings and pre-existing services restored. Backup: $BACKUP"
 echo 'Installed packages were retained; unrelated UFW rules were preserved.'
 echo 'Public keys added to authorized_keys were retained.'

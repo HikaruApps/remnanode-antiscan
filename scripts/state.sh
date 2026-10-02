@@ -3,6 +3,9 @@
 STATE=/var/lib/ufw-antiscan
 PENDING=$STATE/pending
 SSH_DROPIN=/etc/ssh/sshd_config.d/00-remnanode-antiscan.conf
+TUNING_BBR_SYSCTL=/etc/sysctl.d/99-remnanode-antiscan-bbr-cake.conf
+TUNING_IPV6_SYSCTL=/etc/sysctl.d/99-remnanode-antiscan-ipv6.conf
+TUNING_MODULES=/etc/modules-load.d/remnanode-antiscan.conf
 FIREWALL_MANAGED_FILES=(
  /etc/ufw/before.rules /etc/ufw/before6.rules
  /etc/fail2ban/jail.d/ufw-antiscan-ssh.conf
@@ -21,8 +24,15 @@ BASIC_MANAGED_FILES=(
  "$SSH_DROPIN"
  /etc/fail2ban/jail.d/ufw-antiscan-ssh.conf
 )
+TUNING_MANAGED_FILES=(
+ "$TUNING_BBR_SYSCTL"
+ "$TUNING_IPV6_SYSCTL"
+ "$TUNING_MODULES"
+)
 FIREWALL_MANAGED_SERVICES=(ufw-antiscan-blocklists.timer ufw-antiscan-ipsets.service fail2ban crowdsec crowdsec-firewall-bouncer)
 BASIC_MANAGED_SERVICES=(fail2ban crowdsec crowdsec-firewall-bouncer)
+TUNING_MANAGED_SERVICES=()
+TUNING_SYSCTL_KEYS=(net.core.default_qdisc net.ipv4.tcp_congestion_control)
 
 snapshot_kind() {
     if [[ -f "$1/kind" ]]; then
@@ -44,6 +54,10 @@ managed_items() {
         basic)
             files_ref=("${BASIC_MANAGED_FILES[@]}")
             services_ref=("${BASIC_MANAGED_SERVICES[@]}")
+            ;;
+        tuning)
+            files_ref=("${TUNING_MANAGED_FILES[@]}")
+            services_ref=("${TUNING_MANAGED_SERVICES[@]}")
             ;;
         *) return 1 ;;
     esac
@@ -67,6 +81,64 @@ snapshot() {
         systemctl is-active "$unit" > "$dest/services/$unit.active" 2>/dev/null || true
         systemctl is-enabled "$unit" > "$dest/services/$unit.enabled" 2>/dev/null || true
     done
+    if [[ "$kind" == tuning ]]; then
+        snapshot_tuning_runtime "$dest"
+    fi
+}
+
+snapshot_tuning_runtime() {
+    local dest=$1 key path iface
+    mkdir -p "$dest/sysctl" "$dest/ipv6-disable"
+    for key in "${TUNING_SYSCTL_KEYS[@]}"; do
+        if ! sysctl -n "$key" > "$dest/sysctl/$key" 2>/dev/null; then
+            rm -f "$dest/sysctl/$key"
+        fi
+    done
+    if [[ -d /proc/sys/net/ipv6/conf ]]; then
+        for path in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+            [[ -f "$path" ]] || continue
+            iface=${path%/disable_ipv6}
+            iface=${iface##*/}
+            [[ "$iface" != all ]] || continue
+            < "$path" tr -d '\n' > "$dest/ipv6-disable/$iface"
+        done
+    fi
+}
+
+restore_tuning_runtime() {
+    local dest=$1 key value file iface failed=0 default_value
+    if tuning_scope_selected "$dest" bbr; then
+        for key in "${TUNING_SYSCTL_KEYS[@]}"; do
+            file="$dest/sysctl/$key"
+            [[ -f "$file" ]] || continue
+            value=$(cat "$file")
+            sysctl -q -w "$key=$value" || failed=1
+        done
+    fi
+    if tuning_scope_selected "$dest" ipv6 && \
+        [[ -f "$dest/ipv6-disable/default" && -d /proc/sys/net/ipv6/conf ]]; then
+        default_value=$(cat "$dest/ipv6-disable/default")
+        sysctl -q -w "net.ipv6.conf.all.disable_ipv6=$default_value" || failed=1
+        for file in "$dest"/ipv6-disable/*; do
+            [[ -f "$file" ]] || continue
+            iface=${file##*/}
+            [[ "$iface" != all ]] || continue
+            [[ -f "/proc/sys/net/ipv6/conf/$iface/disable_ipv6" ]] || continue
+            value=$(cat "$file")
+            printf '%s\n' "$value" > "/proc/sys/net/ipv6/conf/$iface/disable_ipv6" || failed=1
+        done
+    fi
+    return "$failed"
+}
+
+tuning_scope_selected() {
+    local dest=$1 scope=$2
+    # Snapshots from the first tuning development builds had no scope markers.
+    # Treat them as covering both scopes so recovery remains conservative.
+    if [[ ! -f "$dest/restore-bbr" && ! -f "$dest/restore-ipv6" ]]; then
+        return 0
+    fi
+    [[ -f "$dest/restore-$scope" ]]
 }
 restore_files() {
     local dest=$1 file tmp kind
@@ -74,6 +146,16 @@ restore_files() {
     kind=$(snapshot_kind "$dest")
     managed_items "$kind" files services || return 1
     for file in "${files[@]}"; do
+        if [[ "$kind" == tuning ]]; then
+            case "$file" in
+                "$TUNING_BBR_SYSCTL"|"$TUNING_MODULES")
+                    tuning_scope_selected "$dest" bbr || continue
+                    ;;
+                "$TUNING_IPV6_SYSCTL")
+                    tuning_scope_selected "$dest" ipv6 || continue
+                    ;;
+            esac
+        fi
         [[ "${2:-}" == uninstall && "$file" == /etc/ufw/before*.rules ]] && continue
         if [[ -e "$dest/files$file" || -L "$dest/files$file" ]]; then
             mkdir -p "$(dirname "$file")" || return 1
@@ -179,6 +261,10 @@ restore_snapshot() {
             restore_files "$dest" || return 1
             [[ "$ssh_changed" == 0 ]] || reload_ssh || failed=1
             restore_services "$dest" || failed=1
+            ;;
+        tuning)
+            restore_files "$dest" || return 1
+            restore_tuning_runtime "$dest" || failed=1
             ;;
         *) return 1 ;;
     esac
