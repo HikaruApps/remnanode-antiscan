@@ -12,31 +12,6 @@ err()  { echo -e "${RED}[x]${NC} $*" >&2; exit 1; }
 ok()   { echo -e "${GREEN}[ok]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 
-recover_parent_ssh_connection() {
-    python3 - "$$" <<'PY'
-import os
-import sys
-
-pid = int(sys.argv[1])
-seen = set()
-while pid > 1 and pid not in seen:
-    seen.add(pid)
-    try:
-        environment = open(f'/proc/{pid}/environ', 'rb').read().split(b'\0')
-        for item in environment:
-            if item.startswith(b'SSH_CONNECTION='):
-                value = item.split(b'=', 1)[1].decode(errors='strict')
-                if len(value.split()) == 4:
-                    print(value)
-                    raise SystemExit(0)
-        raw = open(f'/proc/{pid}/stat').read()
-        pid = int(raw.rsplit(')', 1)[1].split()[1])
-    except (FileNotFoundError, PermissionError, UnicodeDecodeError, IndexError, ValueError):
-        break
-raise SystemExit(1)
-PY
-}
-
 write_bbr_config() {
     local sysctl_stage modules_stage
     mkdir -p /etc/sysctl.d /etc/modules-load.d
@@ -109,10 +84,7 @@ apply_tuning() {
         command -v "$command" >/dev/null || err "Не найдена команда: $command"
     done
     systemctl show-environment >/dev/null || err "Нужен работающий systemd"
-    if [[ -z ${SSH_CONNECTION:-} ]]; then
-        SSH_CONNECTION=$(recover_parent_ssh_connection || true)
-        export SSH_CONNECTION
-    fi
+    recover_ssh_connection
 
     if [[ "$ENABLE_BBR_CAKE" == 1 ]]; then
         [[ -e /proc/sys/net/core/default_qdisc ]] || err "Ядро не предоставляет net.core.default_qdisc"
@@ -132,7 +104,7 @@ apply_tuning() {
         fi
     fi
 
-    exec 9>/run/lock/ufw-antiscan.lock
+    exec 9>"$LOCK_FILE"
     flock -n 9 || err "Другая операция AntiScan уже выполняется"
     mkdir -p "$STATE" /var/backups/ufw-antiscan
     chmod 700 "$STATE"

@@ -2,14 +2,23 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/state.sh"
 [[ $EUID == 0 ]] || { echo 'Run as root' >&2; exit 1; }
-exec 9>/run/lock/ufw-antiscan.lock
+exec 9>"$LOCK_FILE"
 flock -x 9
-[[ -f "$PENDING" ]] || { echo 'No pending application'; exit 0; }
+if [[ ! -f "$PENDING" ]]; then
+    if [[ -f "$AUTO_RESTORED" ]]; then
+        echo "Nothing to confirm: the unconfirmed changes were already rolled back ($(cat "$AUTO_RESTORED"))." >&2
+        echo 'Apply the changes again if they are still needed.' >&2
+        exit 1
+    fi
+    echo 'No pending application'
+    exit 0
+fi
 BACKUP=$(cat "$PENDING")
+recover_ssh_connection
 # Require a different SSH connection when installation ran over SSH.
 if [[ -s "$BACKUP/ssh-connection" ]]; then
     [[ -n "${SSH_CONNECTION:-}" && "$SSH_CONNECTION" != "$(cat "$BACKUP/ssh-connection")" ]] || {
-        echo 'Confirm from a NEW SSH connection; preserve SSH_CONNECTION with sudo.' >&2
+        echo 'Confirm from a NEW SSH connection.' >&2
         exit 1
     }
 fi
@@ -45,7 +54,7 @@ while pid > 1:
         break
     pid = parent
 if not found:
-    raise SystemExit('Could not verify a fresh sshd session.')
+    raise SystemExit('Could not verify a fresh sshd session; run confirm directly in a new SSH login, not inside tmux/screen.')
 PY
 fi
 rm -f "$PENDING"

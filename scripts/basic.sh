@@ -66,6 +66,7 @@ add_key() {
     command -v python3 >/dev/null || err "python3 не найден"
     daemon=$(sshd_bin) || err "sshd не найден"
     account_data
+    recover_ssh_connection
     check_authorized_keys_location "$daemon"
 
     IFS= read -r key || err "SSH-ключ не получен"
@@ -156,6 +157,7 @@ PY
 setup_fail2ban() {
     if ! command -v fail2ban-client >/dev/null; then
         info "Устанавливаю Fail2Ban..."
+        apt-get update -q
         DEBIAN_FRONTEND=noninteractive apt-get install -y -q fail2ban
     fi
     mkdir -p /etc/fail2ban/jail.d
@@ -165,14 +167,14 @@ enabled  = true
 port     = ${SSH_PORT}
 filter   = sshd
 backend  = systemd
-maxretry = 5
-findtime = 300
-bantime  = 86400
+maxretry = ${F2B_MAXRETRY}
+findtime = ${F2B_FINDTIME}
+bantime  = ${F2B_BANTIME}
 EOF
     fail2ban-client -t
     systemctl enable --now fail2ban
     systemctl restart fail2ban
-    ok "Fail2Ban настроен для SSH-порта $SSH_PORT"
+    ok "Fail2Ban настроен для SSH-порта $SSH_PORT (${F2B_MAXRETRY} попыток/${F2B_FINDTIME}с, бан ${F2B_BANTIME}с)"
 }
 
 setup_crowdsec() {
@@ -202,6 +204,23 @@ setup_crowdsec() {
     ok "CrowdSec и firewall bouncer запущены"
 }
 
+# Without passwords, the effective config must still allow a key-only login;
+# otherwise the reload would lock everyone out until the safety rollback.
+check_key_login_possible() {
+    local effective=$1 methods root_login
+    methods=$(awk '$1 == "authenticationmethods" { $1 = ""; sub(/^ /, ""); print; exit }' <<< "$effective")
+    if [[ -n "$methods" && "$methods" != any ]] && ! tr ' ' '\n' <<< "$methods" | grep -qx publickey; then
+        err "AuthenticationMethods ($methods) требует не только ключ: без пароля вход станет невозможен"
+    fi
+    if [[ "$TARGET_UID" == 0 ]]; then
+        root_login=$(awk '$1 == "permitrootlogin" { print $2; exit }' <<< "$effective")
+        case "$root_login" in
+            yes|prohibit-password|without-password) ;;
+            *) err "PermitRootLogin ${root_login:-?}: root не сможет войти по ключу" ;;
+        esac
+    fi
+}
+
 apply_basic() {
     local daemon backup original_stage effective code project_root server_address ssh_stage=""
     DISABLE_SSH_PASSWORD=${DISABLE_SSH_PASSWORD:-0}
@@ -210,9 +229,19 @@ apply_basic() {
     ENABLE_CROWDSEC=${ENABLE_CROWDSEC:-0}
     SAFETY_TIMER=${SAFETY_TIMER:-180}
     SSH_PORT=${SSH_PORT:-22}
+    F2B_MAXRETRY=${F2B_MAXRETRY:-5}
+    F2B_FINDTIME=${F2B_FINDTIME:-300}
+    F2B_BANTIME=${F2B_BANTIME:-86400}
     for value in "$DISABLE_SSH_PASSWORD" "$KEY_TEST_CONFIRMED" "$ENABLE_FAIL2BAN" "$ENABLE_CROWDSEC"; do
         [[ "$value" == 0 || "$value" == 1 ]] || err "Флаги Basic должны быть 0 или 1"
     done
+    for value in "$F2B_MAXRETRY" "$F2B_FINDTIME" "$F2B_BANTIME"; do
+        [[ "$value" =~ ^[0-9]{1,9}$ ]] && (( 10#$value >= 1 )) \
+            || err "Параметры Fail2Ban должны быть положительными числами"
+    done
+    F2B_MAXRETRY=$((10#$F2B_MAXRETRY))
+    F2B_FINDTIME=$((10#$F2B_FINDTIME))
+    F2B_BANTIME=$((10#$F2B_BANTIME))
     [[ "$SAFETY_TIMER" =~ ^[0-9]{1,10}$ ]] || err "SAFETY_TIMER должен быть числом"
     (( 10#$SAFETY_TIMER >= 60 && 10#$SAFETY_TIMER <= 3600 )) \
         || err "SAFETY_TIMER должен быть от 60 до 3600 секунд"
@@ -224,6 +253,7 @@ apply_basic() {
 
     daemon=$(sshd_bin) || err "sshd не найден"
     account_data
+    recover_ssh_connection
     if [[ "$DISABLE_SSH_PASSWORD" == 1 ]]; then
         check_authorized_keys_location "$daemon"
         command -v ssh-keygen >/dev/null || err "ssh-keygen не найден"
@@ -235,7 +265,7 @@ apply_basic() {
     systemctl show-environment >/dev/null || err "Нужен работающий systemd"
     [[ "$ENABLE_CROWDSEC" == 0 ]] || command -v curl >/dev/null || err "Для CrowdSec нужен curl"
 
-    exec 9>/run/lock/ufw-antiscan.lock
+    exec 9>"$LOCK_FILE"
     flock -n 9 || err "Другая операция AntiScan уже выполняется"
     mkdir -p "$STATE" /var/backups/ufw-antiscan
     chmod 700 "$STATE"
@@ -282,7 +312,6 @@ PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
-PermitRootLogin prohibit-password
 EOF
         chmod 600 "$ssh_stage"
         chown root:root "$ssh_stage"
@@ -293,6 +322,7 @@ EOF
         grep -qx 'pubkeyauthentication yes' <<< "$effective" || err "sshd не включил вход по ключу"
         grep -qx 'passwordauthentication no' <<< "$effective" || err "sshd не отключил вход по паролю"
         grep -qx 'kbdinteractiveauthentication no' <<< "$effective" || err "sshd не отключил keyboard-interactive"
+        check_key_login_possible "$effective"
         reload_ssh
         ok "Парольный вход SSH отключён эффективной конфигурацией sshd"
     fi

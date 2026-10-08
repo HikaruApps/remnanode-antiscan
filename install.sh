@@ -49,6 +49,7 @@ ENV для команды basic apply:
   KEY_TEST_CONFIRMED    1 — подтверждён вход ключом без пароля
   ENABLE_FAIL2BAN       1/0 — установить Fail2Ban
   ENABLE_CROWDSEC       1/0 — установить CrowdSec
+  F2B_MAXRETRY/FINDTIME/BANTIME  Параметры SSH jail (5/300/86400 секунд)
 
 ENV для команды protect (Experimental):
   SSH_PORT              Порт SSH (авто-детект если не задан)
@@ -63,6 +64,7 @@ ENV для команды protect (Experimental):
   CONN_LIMIT            Макс одновременных соединений с одного IP (по умолч.: 600)
   ENABLE_SSH_RATE_LIMIT 1/0 — отдельный SSH SYN rate-limit
   ENABLE_PORTSCAN_BAN   1/0 — эвристический автобан сканирования
+  PORTSCAN_SKIP_PORT_CHECK 1 — не сверять разрешённые порты UFW со списками
   ENABLE_ICMP_RATE_LIMIT 1/0 — ICMP echo rate-limit
   ENABLE_FAIL2BAN       1/0 — установить Fail2Ban
   ENABLE_CROWDSEC       1/0 — установить CrowdSec (по умолч.: 0)
