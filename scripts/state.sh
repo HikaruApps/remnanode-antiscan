@@ -2,6 +2,9 @@
 # Root-owned state; shared by apply, confirm, timed restore and uninstall.
 STATE=/var/lib/ufw-antiscan
 PENDING=$STATE/pending
+AUTO_RESTORED=$STATE/auto-restored
+# Root-only directory: /run/lock is world-writable on Debian/Ubuntu.
+LOCK_FILE=/run/ufw-antiscan.lock
 SSH_DROPIN=/etc/ssh/sshd_config.d/00-remnanode-antiscan.conf
 TUNING_BBR_SYSCTL=/etc/sysctl.d/99-remnanode-antiscan-bbr-cake.conf
 TUNING_IPV6_SYSCTL=/etc/sysctl.d/99-remnanode-antiscan-ipv6.conf
@@ -86,9 +89,46 @@ snapshot() {
     fi
 }
 
+# sudo drops SSH_CONNECTION unless it is preserved explicitly. Without it the
+# fresh-session check in confirm would silently be skipped, so recover it from
+# the nearest ancestor that still has it (sshd sets it for the login shell).
+recover_ssh_connection() {
+    [[ -z ${SSH_CONNECTION:-} ]] || return 0
+    command -v python3 >/dev/null || return 0
+    SSH_CONNECTION=$(python3 - "$$" <<'PY' || true
+import sys
+
+pid = int(sys.argv[1])
+seen = set()
+while pid > 1 and pid not in seen:
+    seen.add(pid)
+    try:
+        environment = open(f'/proc/{pid}/environ', 'rb').read().split(b'\0')
+        for item in environment:
+            if item.startswith(b'SSH_CONNECTION='):
+                value = item.split(b'=', 1)[1].decode(errors='strict')
+                if len(value.split()) == 4:
+                    print(value)
+                    raise SystemExit(0)
+        raw = open(f'/proc/{pid}/stat').read()
+        pid = int(raw.rsplit(')', 1)[1].split()[1])
+    except (FileNotFoundError, PermissionError, UnicodeDecodeError, IndexError, ValueError):
+        break
+raise SystemExit(1)
+PY
+)
+    export SSH_CONNECTION
+}
+
 snapshot_tuning_runtime() {
     local dest=$1 key path iface
     mkdir -p "$dest/sysctl" "$dest/ipv6-disable"
+    # Disabling IPv6 drops static addresses and routes; re-enabling it does not
+    # bring them back until the network is reconfigured, so keep a copy.
+    if command -v ip >/dev/null; then
+        ip -6 -j addr show > "$dest/ipv6-addr.json" 2>/dev/null || rm -f "$dest/ipv6-addr.json"
+        ip -6 -j route show table main > "$dest/ipv6-route.json" 2>/dev/null || rm -f "$dest/ipv6-route.json"
+    fi
     for key in "${TUNING_SYSCTL_KEYS[@]}"; do
         if ! sysctl -n "$key" > "$dest/sysctl/$key" 2>/dev/null; then
             rm -f "$dest/sysctl/$key"
@@ -127,8 +167,65 @@ restore_tuning_runtime() {
             value=$(cat "$file")
             printf '%s\n' "$value" > "/proc/sys/net/ipv6/conf/$iface/disable_ipv6" || failed=1
         done
+        restore_ipv6_static "$dest" || failed=1
     fi
     return "$failed"
+}
+
+# Re-add static global IPv6 addresses and routes lost while IPv6 was disabled.
+# Interfaces that already have a global address are left alone, so a stale
+# snapshot never adds addresses next to a working configuration.
+restore_ipv6_static() {
+    local dest=$1
+    [[ -s "$dest/ipv6-addr.json" ]] || return 0
+    command -v ip >/dev/null && command -v python3 >/dev/null || return 0
+    python3 - "$dest/ipv6-addr.json" "${dest}/ipv6-route.json" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+def load(path):
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return []
+
+def current_global(ifname):
+    result = subprocess.run(['ip', '-6', '-j', 'addr', 'show', 'dev', ifname, 'scope', 'global'],
+                            capture_output=True, text=True)
+    try:
+        data = json.loads(result.stdout or '[]')
+    except ValueError:
+        return True
+    return any(entry.get('addr_info') for entry in data)
+
+restored = set()
+for link in load(sys.argv[1]):
+    ifname = link.get('ifname')
+    if not ifname or not os.path.exists(f'/proc/sys/net/ipv6/conf/{ifname}/disable_ipv6'):
+        continue
+    static = [a for a in link.get('addr_info', [])
+              if a.get('scope') == 'global' and not a.get('dynamic') and a.get('local')]
+    if not static or current_global(ifname):
+        continue
+    for address in static:
+        subprocess.run(['ip', '-6', 'addr', 'add', f"{address['local']}/{address['prefixlen']}",
+                        'dev', ifname], check=False)
+    restored.add(ifname)
+for route in load(sys.argv[2]):
+    dev = route.get('dev')
+    if dev not in restored or route.get('protocol') not in ('boot', 'static'):
+        continue
+    command = ['ip', '-6', 'route', 'replace', route.get('dst', 'default')]
+    if route.get('gateway'):
+        command += ['via', route['gateway']]
+    command += ['dev', dev]
+    if route.get('metric') is not None:
+        command += ['metric', str(route['metric'])]
+    subprocess.run(command, check=False)
+PY
 }
 
 tuning_scope_selected() {
@@ -278,6 +375,7 @@ arm_safety() {
         return 1
     fi
     printf '%s\n' "$backup" > "$PENDING"
+    rm -f "$AUTO_RESTORED"
     systemctl disable --now ufw-antiscan-safety.timer 2>/dev/null || true
     systemctl reset-failed ufw-antiscan-safety.service 2>/dev/null || true
     deadline=$(date -u -d "@$(($(date +%s) + seconds))" '+%Y-%m-%d %H:%M:%S UTC') || return 1

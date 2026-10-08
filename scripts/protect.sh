@@ -56,6 +56,7 @@ ENV-переменные:
   PORTSCAN_BAN_SECONDS      Время бана за сканирование в секундах (по умолчанию: 3600)
   ENABLE_PORTSCAN_BAN       1/0 — включить portscan autoban (по умолчанию: 0)
   PORTSCAN_HITS/WINDOW      Порог событий / окно в секундах (10 / 60)
+  PORTSCAN_SKIP_PORT_CHECK  1 — не требовать, чтобы порты из UFW были в списках (0)
   ENABLE_ICMP_RATE_LIMIT    1/0 — ограничивать ICMP echo-request (0)
   ICMP_RATE / ICMP_BURST    Лимит echo-request с IP в секунду (5/10)
   SAFETY_TIMER             Время на подтверждение из нового SSH (180 секунд)
@@ -109,6 +110,7 @@ ENABLE_SSH_RATE_LIMIT="${ENABLE_SSH_RATE_LIMIT:-0}"
 
 PORTSCAN_BAN_SECONDS="${PORTSCAN_BAN_SECONDS:-3600}"
 ENABLE_PORTSCAN_BAN="${ENABLE_PORTSCAN_BAN:-0}"
+PORTSCAN_SKIP_PORT_CHECK="${PORTSCAN_SKIP_PORT_CHECK:-0}"
 PORTSCAN_HITS="${PORTSCAN_HITS:-10}"
 PORTSCAN_WINDOW="${PORTSCAN_WINDOW:-60}"
 ENABLE_ICMP_RATE_LIMIT="${ENABLE_ICMP_RATE_LIMIT:-0}"
@@ -166,7 +168,7 @@ fi
 
 UFW_STATUS=$(ufw status 2>/dev/null | head -1 || true)
 [[ "$UFW_STATUS" != "Status: active" ]] && \
-    warn "UFW сейчас неактивен — правила применятся после: sudo ufw enable"
+    warn "UFW сейчас неактивен — применение будет отклонено; DRY RUN доступен"
 
 WAN_IFACE=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1 || true)
 [[ -z "$WAN_IFACE" ]] && warn "WAN-интерфейс не определён — anti-spoofing будет отключён"
@@ -245,7 +247,112 @@ fi
 if [[ -z "$TCP_PORTS" && ( "$ENABLE_SYN_RATE_LIMIT" == 1 || "$ENABLE_CONN_LIMIT" == 1 ) ]]; then
     err "TCP_PORTS обязателен для SYN rate-limit и connlimit"
 fi
+[[ "$PORTSCAN_SKIP_PORT_CHECK" == 0 || "$PORTSCAN_SKIP_PORT_CHECK" == 1 ]] \
+    || err "PORTSCAN_SKIP_PORT_CHECK должен быть 0 или 1"
+if [[ "$ENABLE_PORTSCAN_BAN" == 1 ]]; then
+    # xt_recent rejects a hitcount it cannot remember (255 max, or below the
+    # module's ip_pkt_list_tot when set); UFW would then fail to load at all.
+    RECENT_MAX=$(cat /sys/module/xt_recent/parameters/ip_pkt_list_tot 2>/dev/null || echo 0)
+    [[ "$RECENT_MAX" =~ ^[0-9]+$ && "$RECENT_MAX" != 0 ]] && RECENT_MAX=$((10#$RECENT_MAX - 1)) || RECENT_MAX=255
+    (( 10#$PORTSCAN_HITS <= 10#$RECENT_MAX )) \
+        || err "PORTSCAN_HITS не может превышать ${RECENT_MAX} (ограничение модуля xt_recent)"
+fi
+
+# Every port UFW allows must be a service port for the portscan heuristic:
+# otherwise legitimate clients of that port (e.g. the panel connecting to the
+# node API) are counted as scanners and banned on all ports.
+check_portscan_coverage() {
+    LC_ALL=C ufw status 2>/dev/null | python3 -c '
+import ipaddress
+import re
+import subprocess
+import sys
+
+ssh, tcp, udp, whitelist = sys.argv[1:5]
+covered = {"tcp": {int(ssh)}, "udp": set()}
+covered["tcp"].update(int(p) for p in tcp.split(",") if p.strip())
+covered["udp"].update(int(p) for p in udp.split(",") if p.strip())
+trusted = [ipaddress.ip_network(e.strip(), strict=False) for e in whitelist.split(",") if e.strip()]
+spec_re = re.compile(r"^(\d+(?::\d+)?(?:,\d+(?::\d+)?)*)(?:/(tcp|udp))?$")
+problems = []
+
+def is_address(token):
+    try:
+        ipaddress.ip_network(token, strict=False)
+        return True
+    except ValueError:
+        return False
+
+def check_spec(spec, proto, origin):
+    protos = [proto] if proto else ["tcp", "udp"]
+    for part in spec.split(","):
+        if ":" in part:
+            problems.append(f"{origin}: диапазон {part} не поддерживается списками портов")
+            continue
+        for item in protos:
+            if int(part) not in covered[item]:
+                problems.append(f"{origin}: порт {part}/{item} не указан в {item.upper()}_PORTS")
+
+def app_ports(name, origin):
+    result = subprocess.run(["ufw", "app", "info", name], capture_output=True, text=True)
+    lines = result.stdout.splitlines()
+    if result.returncode != 0 or "Ports:" not in [l.strip() for l in lines]:
+        problems.append(f"{origin}: не удалось определить порты профиля {name!r}")
+        return
+    for line in lines[[l.strip() for l in lines].index("Ports:") + 1:]:
+        match = spec_re.match(line.strip())
+        if match:
+            check_spec(match.group(1), match.group(2), origin)
+
+for raw in sys.stdin:
+    line = raw.rstrip()
+    match = re.match(r"^(.*?)\s+(ALLOW|LIMIT)(\s+(?:IN|OUT|FWD))?\s+(.*)$", line)
+    if not match or (match.group(3) or "").strip() in ("OUT", "FWD"):
+        continue
+    to = re.sub(r"\(v6\)|\bon \S+", " ", match.group(1)).split()
+    source = re.sub(r"\(v6\)|\bon \S+", " ", match.group(4)).split()
+    origin = line.strip()
+    ports = [t for t in to if spec_re.match(t)]
+    rest = [t for t in to if t not in ports and t != "Anywhere" and not is_address(t)]
+    if ports:
+        for token in ports:
+            spec = spec_re.match(token)
+            check_spec(spec.group(1), spec.group(2), origin)
+    elif rest:
+        app_ports(" ".join(rest), origin)
+    else:
+        src = source[0] if source else "Anywhere"
+        if src == "Anywhere":
+            problems.append(f"{origin}: UFW пропускает все порты для всех адресов")
+        elif not any(is_address(src) and ipaddress.ip_network(src, strict=False).subnet_of(net)
+                     for net in trusted if ipaddress.ip_network(src, strict=False).version == net.version):
+            problems.append(f"{origin}: {src} разрешены все порты, добавьте его в WHITELIST")
+
+for problem in dict.fromkeys(problems):
+    print(problem)
+sys.exit(3 if problems else 0)
+' "$SSH_PORT" "$TCP_PORTS" "$UDP_PORTS" "$WHITELIST"
+}
+
+if [[ "$ENABLE_PORTSCAN_BAN" == 1 && "$UFW_STATUS" == "Status: active" ]]; then
+    if ! COVERAGE=$(check_portscan_coverage); then
+        warn "Portscan autoban забанит легитимных клиентов этих разрешённых в UFW портов:"
+        while IFS= read -r line; do warn "  $line"; done <<< "${COVERAGE:-не удалось разобрать ufw status}"
+        if [[ "$DRY_RUN" != 1 && "$PORTSCAN_SKIP_PORT_CHECK" != 1 ]]; then
+            err "Добавьте порты в TCP_PORTS/UDP_PORTS (или IP в WHITELIST); PORTSCAN_SKIP_PORT_CHECK=1 — применить как есть"
+        fi
+    fi
+fi
 # ── Генерация правил ──────────────────────────────────────────────────────────
+# xt_hashlimit reuses an existing table with the same name and keeps its old
+# rate, so new limits would be silently ignored on re-apply. Derive the name
+# from the parameters (max 15 characters).
+hashlimit_name() {
+    local sum
+    sum=$(printf '%s ' "$@" | cksum | cut -d' ' -f1)
+    printf '%s_%06x' "$1" $((sum % 16777216))
+}
+
 build_rules() {
     local FAMILY="$1"
     local CHAIN
@@ -337,7 +444,7 @@ build_rules() {
         IFS=',' read -ra TPORTS <<< "$TCP_PORTS"
         for p in "${TPORTS[@]}"; do
             p="${p// /}"
-            echo "-A ${CHAIN} -p tcp --dport ${p} --syn -m hashlimit --hashlimit-above ${SYN_RATE}/sec --hashlimit-burst ${SYN_BURST} --hashlimit-mode srcip --hashlimit-name syn_${p} --hashlimit-htable-expire 10000 -j DROP"
+            echo "-A ${CHAIN} -p tcp --dport ${p} --syn -m hashlimit --hashlimit-above ${SYN_RATE}/sec --hashlimit-burst ${SYN_BURST} --hashlimit-mode srcip --hashlimit-name $(hashlimit_name "syn${p}" "$SYN_RATE" "$SYN_BURST") --hashlimit-htable-expire 10000 -j DROP"
         done
         echo ""
     fi
@@ -358,7 +465,7 @@ build_rules() {
 
     if [[ "$ENABLE_SSH_RATE_LIMIT" == 1 ]]; then
         echo "# ── SSH per-IP rate-limit ───────────────────────────────────────────"
-        echo "-A ${CHAIN} -p tcp --dport ${SSH_PORT} --syn -m hashlimit --hashlimit-above ${SSH_RATE}/minute --hashlimit-burst ${SSH_BURST} --hashlimit-mode srcip --hashlimit-name ssh_rate --hashlimit-htable-expire 60000 -j DROP"
+        echo "-A ${CHAIN} -p tcp --dport ${SSH_PORT} --syn -m hashlimit --hashlimit-above ${SSH_RATE}/minute --hashlimit-burst ${SSH_BURST} --hashlimit-mode srcip --hashlimit-name $(hashlimit_name ssh "$SSH_RATE" "$SSH_BURST") --hashlimit-htable-expire 60000 -j DROP"
     fi
 
     # AntiScan: сервисные порты возвращаем в обычную обработку UFW.
@@ -391,9 +498,9 @@ build_rules() {
     if [[ "$ENABLE_ICMP_RATE_LIMIT" == 1 ]]; then
         echo "# ── ICMP rate-limit ─────────────────────────────────────────────────"
         if [[ "$FAMILY" == "4" ]]; then
-            echo "-A ${CHAIN} -p icmp --icmp-type echo-request -m hashlimit --hashlimit-above ${ICMP_RATE}/sec --hashlimit-burst ${ICMP_BURST} --hashlimit-mode srcip --hashlimit-name icmp_rate -j DROP"
+            echo "-A ${CHAIN} -p icmp --icmp-type echo-request -m hashlimit --hashlimit-above ${ICMP_RATE}/sec --hashlimit-burst ${ICMP_BURST} --hashlimit-mode srcip --hashlimit-name $(hashlimit_name icmp "$ICMP_RATE" "$ICMP_BURST") -j DROP"
         else
-            echo "-A ${CHAIN} -p ipv6-icmp --icmpv6-type echo-request -m hashlimit --hashlimit-above ${ICMP_RATE}/sec --hashlimit-burst ${ICMP_BURST} --hashlimit-mode srcip --hashlimit-name icmp6_rate -j DROP"
+            echo "-A ${CHAIN} -p ipv6-icmp --icmpv6-type echo-request -m hashlimit --hashlimit-above ${ICMP_RATE}/sec --hashlimit-burst ${ICMP_BURST} --hashlimit-mode srcip --hashlimit-name $(hashlimit_name icmp6 "$ICMP_RATE" "$ICMP_BURST") -j DROP"
         fi
     fi
 
@@ -423,7 +530,7 @@ command -v flock >/dev/null || err "flock is required"
 [[ "$UFW_STATUS" == "Status: active" ]] || err "Enable and configure UFW before applying AntiScan"
 iptables -S >/dev/null || err "Cannot read netfilter rules: CAP_NET_ADMIN is required"
 systemctl show-environment >/dev/null || err "A running systemd manager is required"
-exec 9>/run/lock/ufw-antiscan.lock
+exec 9>"$LOCK_FILE"
 flock -n 9 || err "Another AntiScan operation is running"
 mkdir -p "$STATE" /var/backups/ufw-antiscan
 chmod 700 "$STATE"
@@ -435,6 +542,7 @@ if [[ ! -d "$STATE/original" ]]; then
     cp -a "$BACKUP_DIR/." "$ORIGINAL_STAGE/"
     mv -T "$ORIGINAL_STAGE" "$STATE/original"
 fi
+recover_ssh_connection
 printf '%s' "${SSH_CONNECTION:-}" > "$BACKUP_DIR/ssh-connection"
 rollback_on_error() {
     local code=$?
@@ -476,11 +584,14 @@ if [[ "$ENABLE_FAIL2BAN" == 1 ]]; then
     section "fail2ban (SSH brute-force)"
     if ! command -v fail2ban-client &>/dev/null; then
         info "Устанавливаю fail2ban..."
-        apt-get install -y -q fail2ban
+        apt-get update -q
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q fail2ban
     fi
+    mkdir -p /etc/fail2ban/jail.d
     cat > /etc/fail2ban/jail.d/ufw-antiscan-ssh.conf << F2BEOF
 [sshd]
 enabled  = true
+ignoreip = 127.0.0.1/8 ::1 ${WHITELIST//,/ }
 port     = ${SSH_PORT}
 filter   = sshd
 backend  = systemd
@@ -517,7 +628,7 @@ https://packagecloud.io/crowdsec/crowdsec/${ID} ${VERSION_CODENAME} main" \
 
         apt-get update -q
         info "Устанавливаю crowdsec..."
-        apt-get install -y -q crowdsec
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q crowdsec
         ok "CrowdSec агент установлен"
     else
         ok "CrowdSec уже установлен"
@@ -526,7 +637,7 @@ https://packagecloud.io/crowdsec/crowdsec/${ID} ${VERSION_CODENAME} main" \
     # Bouncer через iptables; фактический backend может быть legacy или nft.
     if [[ "$(dpkg-query -W -f='${Status}' crowdsec-firewall-bouncer-iptables 2>/dev/null || true)" != "install ok installed" ]]; then
         info "Устанавливаю crowdsec-firewall-bouncer-iptables..."
-        apt-get install -y -q crowdsec-firewall-bouncer-iptables
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q crowdsec-firewall-bouncer-iptables
         ok "iptables-bouncer установлен"
     else
         ok "iptables-bouncer уже установлен"

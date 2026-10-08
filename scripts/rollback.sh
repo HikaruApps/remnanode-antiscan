@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/state.sh"
     echo 'Automatic CrowdSec purge is no longer supported. Remove it separately if needed.' >&2
     exit 1
 }
-exec 9>/run/lock/ufw-antiscan.lock
+exec 9>"$LOCK_FILE"
 flock -n 9 || { echo 'Another AntiScan operation is running' >&2; exit 1; }
 FIREWALL_ORIGINAL="$STATE/original"
 BASIC_ORIGINAL="$STATE/basic-original"

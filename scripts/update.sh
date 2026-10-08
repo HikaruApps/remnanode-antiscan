@@ -9,7 +9,7 @@ PARENT=$(dirname "$TARGET")
 for command in git python3 flock; do
     command -v "$command" >/dev/null || { echo "Не найдена команда: $command" >&2; exit 1; }
 done
-exec 9>/run/lock/ufw-antiscan.lock
+exec 9>/run/ufw-antiscan.lock
 flock -n 9 || { echo 'Другая операция AntiScan уже выполняется.' >&2; exit 1; }
 [[ ! -f /var/lib/ufw-antiscan/pending ]] || {
     echo 'Сначала подтвердите применение защиты или выполните откат.' >&2; exit 1;
