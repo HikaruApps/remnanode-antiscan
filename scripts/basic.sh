@@ -56,7 +56,7 @@ check_authorized_keys_location() {
 }
 
 add_key() {
-    local daemon key key_type key_blob tmp ssh_dir auth fingerprint
+    local daemon key key_type key_blob ssh_dir auth fingerprint result
     SSH_PORT=${SSH_PORT:-22}
     [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] && (( 10#$SSH_PORT >= 1 && 10#$SSH_PORT <= 65535 )) \
         || err "Некорректный SSH_PORT"
@@ -80,11 +80,12 @@ add_key() {
     esac
     [[ "$key_blob" =~ ^[A-Za-z0-9+/]+={0,3}$ ]] || err "Некорректные данные публичного ключа"
 
-    tmp=$(mktemp)
-    trap 'rm -f "$tmp"' EXIT
-    chmod 600 "$tmp"
-    printf '%s\n' "$key" > "$tmp"
-    fingerprint=$(ssh-keygen -lf "$tmp") || err "ssh-keygen отклонил ключ: вставьте публичный ключ целиком"
+    # Global: the EXIT trap runs after this function's locals are gone.
+    KEY_TMP=$(mktemp)
+    trap 'rm -f -- "${KEY_TMP:-}"' EXIT
+    chmod 600 "$KEY_TMP"
+    printf '%s\n' "$key" > "$KEY_TMP"
+    fingerprint=$(ssh-keygen -lf "$KEY_TMP") || err "ssh-keygen отклонил ключ: вставьте публичный ключ целиком"
     if [[ "$key_type" == ssh-rsa && "${fingerprint%% *}" -lt 2048 ]]; then
         err "RSA-ключ короче 2048 бит не принимается"
     fi
@@ -100,7 +101,7 @@ add_key() {
         install -d -m 700 -o "$TARGET_UID" -g "$TARGET_GID" "$ssh_dir"
     fi
 
-    python3 - "$ssh_dir" "$tmp" "$TARGET_UID" "$TARGET_GID" "$key_type" "$key_blob" <<'PY'
+    result=$(python3 - "$ssh_dir" "$KEY_TMP" "$TARGET_UID" "$TARGET_GID" "$key_type" "$key_blob" <<'PY'
 import fcntl
 import os
 import stat
@@ -150,7 +151,12 @@ finally:
     os.close(fd)
     os.close(dir_fd)
 PY
-    ok "Публичный ключ проверен и безопасно добавлен для $TARGET_USER"
+)
+    if [[ "$result" == SSH_KEY_ALREADY_PRESENT=1 ]]; then
+        ok "Этот ключ уже есть у $TARGET_USER; authorized_keys не изменён"
+    else
+        ok "Публичный ключ проверен и безопасно добавлен для $TARGET_USER"
+    fi
     printf '    %s\n' "$fingerprint"
 }
 
