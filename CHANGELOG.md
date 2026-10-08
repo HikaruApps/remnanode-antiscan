@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Исправлено: Basic сообщал «SSH-ключ не добавлен» и останавливался, хотя ключ уже
+  был записан (`tmp: unbound variable` в EXIT-trap). Уже существующий ключ теперь
+  сообщается отдельно.
 - Basic больше не прописывает `PermitRootLogin prohibit-password`: раньше drop-in
   `00-…` перекрывал `PermitRootLogin no` и снова разрешал вход root по ключу.
 - Basic отказывается отключать пароль, если `AuthenticationMethods` требует не только
