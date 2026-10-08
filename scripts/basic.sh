@@ -200,8 +200,8 @@ setup_crowdsec() {
     if [[ "$(dpkg-query -W -f='${Status}' crowdsec-firewall-bouncer-iptables 2>/dev/null || true)" != "install ok installed" ]]; then
         DEBIAN_FRONTEND=noninteractive apt-get install -y -q crowdsec-firewall-bouncer-iptables
     fi
-    cscli collections install crowdsecurity/linux -q || warn "Коллекция linux не установлена"
-    cscli collections install crowdsecurity/sshd -q || warn "Коллекция sshd не установлена"
+    cscli collections install crowdsecurity/linux --error </dev/null || warn "Коллекция linux не установлена"
+    cscli collections install crowdsecurity/sshd --error </dev/null || warn "Коллекция sshd не установлена"
     if [[ -n "${CROWDSEC_ENROLL_KEY:-}" ]]; then
         cscli console enroll "$CROWDSEC_ENROLL_KEY" || warn "CrowdSec enrollment не выполнен"
     fi

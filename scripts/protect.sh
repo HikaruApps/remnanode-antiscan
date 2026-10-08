@@ -645,10 +645,10 @@ https://packagecloud.io/crowdsec/crowdsec/${ID} ${VERSION_CODENAME} main" \
 
     # Базовые коллекции
     info "Устанавливаю коллекции..."
-    cscli collections install crowdsecurity/linux -q || warn "Коллекция linux не установлена"
-    cscli collections install crowdsecurity/sshd -q || warn "Коллекция sshd не установлена"
-    cscli collections install crowdsecurity/iptables -q || warn "Коллекция iptables не установлена"
-    cscli collections install crowdsecurity/http-cve -q || warn "Коллекция http-cve не установлена"
+    cscli collections install crowdsecurity/linux --error </dev/null || warn "Коллекция linux не установлена"
+    cscli collections install crowdsecurity/sshd --error </dev/null || warn "Коллекция sshd не установлена"
+    cscli collections install crowdsecurity/iptables --error </dev/null || warn "Коллекция iptables не установлена"
+    cscli collections install crowdsecurity/http-cve --error </dev/null || warn "Коллекция http-cve не установлена"
     info "Проверь acquisition и метрики CrowdSec для нужных источников логов"
 
     # Enroll в Console (опционально)
