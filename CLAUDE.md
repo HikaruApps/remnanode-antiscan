@@ -29,6 +29,8 @@ server. A mistake can lock the operator out — preserve the safety mechanisms b
 - `scripts/rules.py` — inserts/removes only the block between
   `# === UFW-ANTISCAN START/END ===` markers in the UFW filter table.
 - `scripts/tuning.sh` — BBR + CAKE defaults and `IPV6_MODE=keep|enable|disable`.
+- `scripts/rkn.sh` — RKN network blocking: ipsets + own `antiscan-rkn` INPUT chain outside
+  the UFW files, list updates via a systemd timer (`apply|update|load|unload|disable|status`).
 - `scripts/confirm.sh` — confirms an apply; requires an SSH session created after the apply.
 - `scripts/restore.sh` — invoked by the safety timer to roll back an unconfirmed apply.
 - `scripts/rollback.sh` — full uninstall; preserves unrelated UFW edits and prior service states.

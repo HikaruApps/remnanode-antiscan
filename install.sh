@@ -37,6 +37,7 @@ ufw-antiscan — защита от сканеров и флуда поверх U
   basic      Basic: SSH-ключ, безопасное отключение пароля, Fail2Ban/CrowdSec
   protect    Experimental: настраиваемые firewall-правила + Fail2Ban/CrowdSec
   tuning     Дополнительные настройки: BBR + CAKE и состояние IPv6
+  rkn        Блокировка подсетей РКН: rkn [apply|update|disable|status]
   confirm    Подтвердить применение из нового SSH-подключения
   rollback   Удалить защиту и восстановить прежние настройки
   status     Показать текущий статус защиты
@@ -70,6 +71,12 @@ ENV для команды protect (Experimental):
   ENABLE_CROWDSEC       1/0 — установить CrowdSec (по умолч.: 0)
   CROWDSEC_ENROLL_KEY   Ключ из app.crowdsec.net (опционально)
   DRY_RUN               1 — показать правила без применения
+
+ENV для команды rkn apply:
+  RKN_URLS              HTTPS-списки подсетей через пробел (по умолч.: notacircle/greatlists gn + sn)
+  WHITELIST             IP/CIDR через запятую — никогда не блокируются
+  RKN_BLOCK_SSH         1 — блокировать и SSH-порт (по умолч.: 0, SSH исключён)
+  RKN_INTERVAL          Период обновления: 30min, 6h, 1d (по умолч.: 6h)
 
 ENV для команды tuning apply:
   ENABLE_BBR_CAKE       1 — включить BBR + CAKE; 0 — не менять
@@ -421,12 +428,68 @@ run_tuning() {
     SAFETY_TIMER="$PARAM_SAFETY_TIMER" bash "$SCRIPT_DIR/scripts/tuning.sh" apply
 }
 
+run_rkn() {
+    local choice
+    echo ""
+    echo -e "  ${BOLD}Блокировка подсетей РКН${NC}"
+    bash "$SCRIPT_DIR/scripts/rkn.sh" status
+    echo ""
+    echo "  1  Включить / перенастроить"
+    echo "  2  Обновить списки сейчас"
+    echo "  3  Отключить"
+    echo "  0  Назад"
+    echo ""
+    printf '  Выберите действие: '
+    read -r choice
+    case "$choice" in
+        1) ;;
+        2) bash "$SCRIPT_DIR/scripts/rkn.sh" update; return ;;
+        3)
+            yn "Отключить блокировку подсетей РКН?" "n"
+            [[ "$YN" == 1 ]] || return 0
+            bash "$SCRIPT_DIR/scripts/rkn.sh" disable
+            return
+            ;;
+        0) return 0 ;;
+        *) info "Неизвестное действие."; return 1 ;;
+    esac
+
+    local ssh_detected
+    ssh_detected=$(ss -tlnp 2>/dev/null \
+        | awk '/sshd/{match($4,/[0-9]+$/); p=substr($4,RSTART,RLENGTH); if(p) print p}' \
+        | head -1 || true)
+    echo ""
+    echo -e "  ${YELLOW}Входящие соединения из подсетей списка будут отбрасываться на всех портах.${NC}"
+    echo -e "  ${YELLOW}Ответы на исходящие соединения ноды и уже открытые сессии не затрагиваются.${NC}"
+    echo ""
+    ask "URL списков (через пробел)" "${RKN_URLS:-https://cdn.jsdelivr.net/gh/notacircle/greatlists@main/gn.lst https://cdn.jsdelivr.net/gh/notacircle/greatlists@main/sn.lst}"
+    PARAM_RKN_URLS="$REPLY"
+    ask "Whitelist IP/CIDR (через запятую, или оставь пустым)" "${WHITELIST:-}"
+    PARAM_WHITELIST="$REPLY"
+    ask "SSH-порт" "${SSH_PORT:-${ssh_detected:-22}}"
+    PARAM_SSH_PORT="$REPLY"
+    yn "Блокировать подсети и на SSH-порту? (риск потерять доступ)" "n"
+    PARAM_RKN_BLOCK_SSH="$YN"
+    ask "Период обновления (30min / 6h / 1d)" "${RKN_INTERVAL:-6h}"
+    PARAM_RKN_INTERVAL="$REPLY"
+    ask "Время safety-таймера, секунд" "${SAFETY_TIMER:-180}"
+    PARAM_SAFETY_TIMER="$REPLY"
+    echo ""
+    yn "Применить блокировку подсетей РКН?" "n"
+    [[ "$YN" == 1 ]] || { info "Применение отменено."; return 0; }
+
+    RKN_URLS="$PARAM_RKN_URLS" WHITELIST="$PARAM_WHITELIST" SSH_PORT="$PARAM_SSH_PORT" \
+    RKN_BLOCK_SSH="$PARAM_RKN_BLOCK_SSH" RKN_INTERVAL="$PARAM_RKN_INTERVAL" \
+    SAFETY_TIMER="$PARAM_SAFETY_TIMER" bash "$SCRIPT_DIR/scripts/rkn.sh" apply
+}
+
 show_protect_menu() {
     local choice
     echo ""
     echo -e "  ${BOLD}Режим Protect${NC}"
     echo "  1  Basic — SSH-ключ, пароль, Fail2Ban/CrowdSec"
     echo "  2  Experimental — ручная настройка сетевых фильтров"
+    echo "  3  Блокировка РКН — авто-обновляемые подсети"
     echo "  0  Назад"
     echo ""
     printf '  Выберите режим: '
@@ -434,6 +497,7 @@ show_protect_menu() {
     case "$choice" in
         1) run_basic ;;
         2) run_experimental ;;
+        3) run_rkn ;;
         0) return 0 ;;
         *) info "Неизвестный режим."; return 1 ;;
     esac
@@ -489,6 +553,9 @@ case "$CMD" in
         ;;
     tuning)
         if [[ -z ${2:-} ]]; then run_tuning; else bash "${SCRIPT_DIR}/scripts/tuning.sh" "${@:2}"; fi
+        ;;
+    rkn)
+        if [[ -z ${2:-} ]]; then run_rkn; else bash "${SCRIPT_DIR}/scripts/rkn.sh" "${@:2}"; fi
         ;;
     update)    bash "$SCRIPT_DIR/scripts/update.sh" ;;
     protect)   bash "${SCRIPT_DIR}/scripts/protect.sh" "${@:2}" ;;
