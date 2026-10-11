@@ -15,7 +15,8 @@ FIREWALL_ORIGINAL="$STATE/original"
 BASIC_ORIGINAL="$STATE/basic-original"
 TUNING_BBR_ORIGINAL="$STATE/tuning-bbr-original"
 TUNING_IPV6_ORIGINAL="$STATE/tuning-ipv6-original"
-[[ -d "$FIREWALL_ORIGINAL" || -d "$BASIC_ORIGINAL" || \
+RKN_ORIGINAL="$STATE/rkn-original"
+[[ -d "$FIREWALL_ORIGINAL" || -d "$BASIC_ORIGINAL" || -d "$RKN_ORIGINAL" || \
    -d "$TUNING_BBR_ORIGINAL" || -d "$TUNING_IPV6_ORIGINAL" ]] || {
     echo 'No installation snapshot. Legacy installations require manual rollback from their backup.' >&2
     exit 1
@@ -24,6 +25,7 @@ TUNING_IPV6_ORIGINAL="$STATE/tuning-ipv6-original"
 BACKUP=$(mktemp -d /var/backups/ufw-antiscan/uninstall.XXXXXXXX)
 if [[ -d "$FIREWALL_ORIGINAL" ]]; then snapshot "$BACKUP/firewall-current" firewall; fi
 if [[ -d "$BASIC_ORIGINAL" ]]; then snapshot "$BACKUP/basic-current" basic; fi
+if [[ -d "$RKN_ORIGINAL" ]]; then snapshot "$BACKUP/rkn-current" rkn; fi
 if [[ -d "$TUNING_BBR_ORIGINAL" || -d "$TUNING_IPV6_ORIGINAL" ]]; then
     snapshot "$BACKUP/tuning-current" tuning
     [[ ! -d "$TUNING_BBR_ORIGINAL" ]] || : > "$BACKUP/tuning-current/restore-bbr"
@@ -41,6 +43,9 @@ rollback_error() {
     fi
     if [[ -d "$BACKUP/tuning-current" ]]; then
         restore_snapshot "$BACKUP/tuning-current" || echo "Tuning restore failed: $BACKUP" >&2
+    fi
+    if [[ -d "$BACKUP/rkn-current" ]]; then
+        restore_snapshot "$BACKUP/rkn-current" || echo "RKN restore failed: $BACKUP" >&2
     fi
     if [[ -f "$PENDING" ]]; then
         arm_safety "$(cat "$PENDING")" 180 || echo 'Failed to rearm recovery timer' >&2
@@ -99,6 +104,7 @@ fi
 [[ "$ssh_changed" == 0 ]] || reload_ssh
 [[ ! -d "$TUNING_BBR_ORIGINAL" ]] || restore_snapshot "$TUNING_BBR_ORIGINAL"
 [[ ! -d "$TUNING_IPV6_ORIGINAL" ]] || restore_snapshot "$TUNING_IPV6_ORIGINAL"
+[[ ! -d "$RKN_ORIGINAL" ]] || restore_snapshot "$RKN_ORIGINAL"
 
 # Only now are there no active references to legacy sets.
 if [[ -d "$FIREWALL_ORIGINAL" ]]; then
@@ -116,6 +122,7 @@ disarm_safety
 [[ ! -d "$BASIC_ORIGINAL" ]] || mv "$BASIC_ORIGINAL" "$BACKUP/basic-original"
 [[ ! -d "$TUNING_BBR_ORIGINAL" ]] || mv "$TUNING_BBR_ORIGINAL" "$BACKUP/tuning-bbr-original"
 [[ ! -d "$TUNING_IPV6_ORIGINAL" ]] || mv "$TUNING_IPV6_ORIGINAL" "$BACKUP/tuning-ipv6-original"
+[[ ! -d "$RKN_ORIGINAL" ]] || mv "$RKN_ORIGINAL" "$BACKUP/rkn-original"
 trap - ERR
 rm -rf /usr/local/lib/ufw-antiscan
 echo "AntiScan removed. SSH, kernel/network settings and pre-existing services restored. Backup: $BACKUP"

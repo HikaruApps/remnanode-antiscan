@@ -9,6 +9,18 @@ SSH_DROPIN=/etc/ssh/sshd_config.d/00-remnanode-antiscan.conf
 TUNING_BBR_SYSCTL=/etc/sysctl.d/99-remnanode-antiscan-bbr-cake.conf
 TUNING_IPV6_SYSCTL=/etc/sysctl.d/99-remnanode-antiscan-ipv6.conf
 TUNING_MODULES=/etc/modules-load.d/remnanode-antiscan.conf
+# RKN network blocking lives outside the UFW files: its own INPUT chain and
+# ipsets, so a failed load never stops UFW itself from starting.
+RKN_CHAIN=antiscan-rkn
+RKN_SET4=ANTISCAN-RKN4
+RKN_SET6=ANTISCAN-RKN6
+RKN_CONF=/etc/remnanode-antiscan/rkn.conf
+RKN_CACHE=$STATE/rkn.list
+RKN_LOCK=/run/ufw-antiscan-rkn.lock
+RKN_LIB=/usr/local/lib/ufw-antiscan/rkn.sh
+RKN_LOAD_UNIT=remnanode-antiscan-rkn.service
+RKN_UPDATE_UNIT=remnanode-antiscan-rkn-update.service
+RKN_TIMER_UNIT=remnanode-antiscan-rkn-update.timer
 FIREWALL_MANAGED_FILES=(
  /etc/ufw/before.rules /etc/ufw/before6.rules
  /etc/fail2ban/jail.d/ufw-antiscan-ssh.conf
@@ -35,6 +47,14 @@ TUNING_MANAGED_FILES=(
 FIREWALL_MANAGED_SERVICES=(ufw-antiscan-blocklists.timer ufw-antiscan-ipsets.service fail2ban crowdsec crowdsec-firewall-bouncer)
 BASIC_MANAGED_SERVICES=(fail2ban crowdsec crowdsec-firewall-bouncer)
 TUNING_MANAGED_SERVICES=()
+RKN_MANAGED_FILES=(
+ "/etc/systemd/system/$RKN_LOAD_UNIT"
+ "/etc/systemd/system/$RKN_UPDATE_UNIT"
+ "/etc/systemd/system/$RKN_TIMER_UNIT"
+ "$RKN_CONF"
+ "$RKN_CACHE"
+)
+RKN_MANAGED_SERVICES=("$RKN_LOAD_UNIT" "$RKN_TIMER_UNIT")
 TUNING_SYSCTL_KEYS=(net.core.default_qdisc net.ipv4.tcp_congestion_control)
 
 snapshot_kind() {
@@ -61,6 +81,10 @@ managed_items() {
         tuning)
             files_ref=("${TUNING_MANAGED_FILES[@]}")
             services_ref=("${TUNING_MANAGED_SERVICES[@]}")
+            ;;
+        rkn)
+            files_ref=("${RKN_MANAGED_FILES[@]}")
+            services_ref=("${RKN_MANAGED_SERVICES[@]}")
             ;;
         *) return 1 ;;
     esac
@@ -362,6 +386,17 @@ restore_snapshot() {
         tuning)
             restore_files "$dest" || return 1
             restore_tuning_runtime "$dest" || failed=1
+            ;;
+        rkn)
+            # Stop first: ExecStop unloads the chain and sets of the current setup.
+            systemctl disable --now "$RKN_TIMER_UNIT" 2>/dev/null || true
+            systemctl disable --now "$RKN_LOAD_UNIT" 2>/dev/null || true
+            if [[ -x "$RKN_LIB" ]]; then
+                "$RKN_LIB" unload || failed=1
+            fi
+            restore_files "$dest" || return 1
+            rmdir "$(dirname "$RKN_CONF")" 2>/dev/null || true
+            restore_services "$dest" || failed=1
             ;;
         *) return 1 ;;
     esac
