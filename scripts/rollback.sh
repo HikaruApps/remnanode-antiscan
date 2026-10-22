@@ -125,6 +125,7 @@ disarm_safety
 [[ ! -d "$RKN_ORIGINAL" ]] || mv "$RKN_ORIGINAL" "$BACKUP/rkn-original"
 trap - ERR
 rm -rf /usr/local/lib/ufw-antiscan
+rm -f "$EXPERIMENTAL_LAST"
 echo "AntiScan removed. SSH, kernel/network settings and pre-existing services restored. Backup: $BACKUP"
 echo 'Installed packages were retained; unrelated UFW rules were preserved.'
 echo 'Public keys added to authorized_keys were retained.'

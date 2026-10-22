@@ -185,7 +185,7 @@ apply_tuning() {
         printf '  ssh -o ControlMaster=no -o ControlPath=none -p %q %q@%q\n' \
             "$local_port" "$ssh_user" "$server_address"
     fi
-    printf '  Из новой сессии: sudo --preserve-env=SSH_CONNECTION bash %q confirm\n' "$project_root/install.sh"
+    printf '  Из новой сессии: sudo bash %q confirm\n' "$project_root/install.sh"
     ok "Дополнительные настройки применены и ожидают подтверждения. Бэкап: $backup"
 }
 

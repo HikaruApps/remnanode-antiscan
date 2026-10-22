@@ -31,7 +31,7 @@ section() { echo -e "\n${BOLD}━━━ $* ━━━${NC}"; }
 # ── Help ──────────────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     cat << 'HELP'
-ufw-antiscan — защита от сканеров и флуда поверх UFW
+RemnaNode AntiScan — Experimental-фильтры поверх UFW
 
 Использование:
   sudo bash scripts/protect.sh [опции]
@@ -42,7 +42,7 @@ ufw-antiscan — защита от сканеров и флуда поверх U
 
 ENV-переменные:
   SSH_PORT                  Порт SSH (по умолчанию: авто-детект)
-  TCP_PORTS                 Сервисные TCP-порты через запятую (по умолчанию: 443,2087)
+  TCP_PORTS                 Сервисные TCP-порты через запятую (по умолчанию: 443)
   UDP_PORTS                 Сервисные UDP-порты через запятую (по умолчанию: 443)
   WHITELIST                 IP/CIDR через запятую — никогда не блокируются
   ENABLE_BAD_TCP_FLAGS      1/0 — отбрасывать некорректные TCP-флаги (0)
@@ -68,7 +68,7 @@ ENV-переменные:
 
 Примеры:
   # Remnawave-нода
-  sudo SSH_PORT=22 TCP_PORTS=443,2087 UDP_PORTS=443 \
+  sudo SSH_PORT=22 TCP_PORTS=443 UDP_PORTS=443 \
        ENABLE_BAD_TCP_FLAGS=1 ENABLE_SYN_RATE_LIMIT=1 \
        WHITELIST="1.2.3.4" bash scripts/protect.sh
 
@@ -94,7 +94,7 @@ SSH_PORT="${SSH_PORT:-$(ss -tlnp 2>/dev/null \
     | head -1 || true)}"
 SSH_PORT="${SSH_PORT:-22}"
 
-TCP_PORTS="${TCP_PORTS:-443,2087}"
+TCP_PORTS="${TCP_PORTS:-443}"
 UDP_PORTS="${UDP_PORTS-443}"
 
 SYN_RATE="${SYN_RATE:-100}"
@@ -747,11 +747,16 @@ ok "Устаревшие статические IP-списки удалены"
 
 mark_confirmation_boundary "$BACKUP_DIR"
 warn "Проверь новое SSH-подключение и VPN. Автооткат через ${SAFETY_TIMER} секунд."
-warn "Из НОВОГО SSH-подключения: sudo --preserve-env=SSH_CONNECTION bash install.sh confirm"
+printf '  Из НОВОГО SSH-подключения: sudo bash %q confirm\n' "$(cd "$SCRIPT_DIR/.." && pwd)/install.sh"
 
 ok "UFW перезагружен"
 [[ "$ENABLE_FAIL2BAN" == 0 ]] || ok "Fail2Ban запущен"
 
 # The timer stays armed until an explicit confirmation from a new connection.
 trap - ERR INT TERM HUP
+# Remember the answers for the next menu run; values were validated above.
+for key in "${EXPERIMENTAL_KEYS[@]}"; do
+    printf '%s=%s\n' "$key" "${!key}"
+done > "$EXPERIMENTAL_LAST.antiscan-new" && mv -f "$EXPERIMENTAL_LAST.antiscan-new" "$EXPERIMENTAL_LAST" \
+    || warn "Не удалось сохранить параметры для следующего запуска"
 ok "Применено, ожидается подтверждение. Бэкап: $BACKUP_DIR"

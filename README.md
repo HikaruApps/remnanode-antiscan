@@ -30,7 +30,7 @@ cd remnanode-antiscan
 sudo --preserve-env=SSH_CONNECTION bash install.sh
 
 # Предварительный просмотр одной явно выбранной Experimental-функции.
-sudo SSH_PORT=22 TCP_PORTS=443,2087 UDP_PORTS=443 \
+sudo SSH_PORT=22 TCP_PORTS=443 UDP_PORTS=443 \
   ENABLE_BAD_TCP_FLAGS=1 DRY_RUN=1 \
   bash install.sh protect
 ```
@@ -91,6 +91,9 @@ timer и требуется ещё одно новое подключение с
 limit, connlimit, SSH rate limit, portscan autoban, ICMP rate limit, Fail2Ban и
 CrowdSec. Параметры спрашиваются только для включённых функций. Перед применением
 показывается итоговая конфигурация; все переключатели по умолчанию выключены.
+После успешного применения ответы сохраняются в `/var/lib/ufw-antiscan/experimental.last`
+(без enroll-ключа CrowdSec) и при следующем запуске меню предлагаются по умолчанию.
+TCP/UDP-порты при первом запуске подставляются из правил UFW.
 
 ### Блокировка подсетей РКН
 
@@ -105,6 +108,10 @@ sudo bash install.sh rkn update    # обновить списки сейчас
 sudo bash install.sh rkn status
 sudo bash install.sh rkn disable
 ```
+
+Повторный `rkn apply` (и пункт «Перенастроить» в меню) сохраняет текущие настройки:
+явно заданные `RKN_URLS`, `WHITELIST`, `SSH_PORT`, `RKN_BLOCK_SSH`, `RKN_INTERVAL`
+заменяют их, а `WHITELIST=` (в меню — `-`) очищает whitelist.
 
 Как это устроено:
 
@@ -190,7 +197,7 @@ Bash/Python, затем заменяет каталог проекта. Посл
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
 | `SSH_PORT` | автоопределение, иначе `22` | Один SSH-порт |
-| `TCP_PORTS` | `443,2087` | Сервисные TCP-порты через запятую |
+| `TCP_PORTS` | `443` (в меню — порты из UFW) | Сервисные TCP-порты через запятую |
 | `UDP_PORTS` | `443` | UDP-порты; `UDP_PORTS=""` отключает список |
 | `WHITELIST` | пусто | IP/CIDR, исключённые из собственных фильтров |
 | `ENABLE_BAD_TCP_FLAGS` | `0` | Фильтрация некорректных TCP-флагов |

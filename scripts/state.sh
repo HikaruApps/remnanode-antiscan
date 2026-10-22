@@ -3,6 +3,16 @@
 STATE=/var/lib/ufw-antiscan
 PENDING=$STATE/pending
 AUTO_RESTORED=$STATE/auto-restored
+# Epoch seconds of the pending rollback; informational, for the menu countdown.
+SAFETY_DEADLINE=$STATE/safety-deadline
+# Last applied Experimental answers, offered as menu defaults (no secrets).
+EXPERIMENTAL_LAST=$STATE/experimental.last
+EXPERIMENTAL_KEYS=(
+ SSH_PORT TCP_PORTS UDP_PORTS WHITELIST ENABLE_BAD_TCP_FLAGS ENABLE_ANTISPOOFING
+ ENABLE_SYN_RATE_LIMIT SYN_RATE SYN_BURST ENABLE_CONN_LIMIT CONN_LIMIT ENABLE_SSH_RATE_LIMIT SSH_RATE SSH_BURST
+ ENABLE_PORTSCAN_BAN PORTSCAN_HITS PORTSCAN_WINDOW PORTSCAN_BAN_SECONDS ENABLE_ICMP_RATE_LIMIT ICMP_RATE ICMP_BURST
+ ENABLE_FAIL2BAN F2B_MAXRETRY F2B_FINDTIME F2B_BANTIME ENABLE_CROWDSEC SAFETY_TIMER
+)
 # Root-only directory: /run/lock is world-writable on Debian/Ubuntu.
 LOCK_FILE=/run/ufw-antiscan.lock
 SSH_DROPIN=/etc/ssh/sshd_config.d/00-remnanode-antiscan.conf
@@ -410,6 +420,7 @@ arm_safety() {
         return 1
     fi
     printf '%s\n' "$backup" > "$PENDING"
+    printf '%s\n' "$(($(date +%s) + seconds))" > "$SAFETY_DEADLINE"
     rm -f "$AUTO_RESTORED"
     systemctl disable --now ufw-antiscan-safety.timer 2>/dev/null || true
     systemctl reset-failed ufw-antiscan-safety.service 2>/dev/null || true
@@ -452,6 +463,7 @@ EOF
 
 disarm_safety() {
     systemctl disable --now ufw-antiscan-safety.timer 2>/dev/null || true
+    rm -f "$SAFETY_DEADLINE"
     rm -f /etc/systemd/system/ufw-antiscan-safety.timer \
           /etc/systemd/system/ufw-antiscan-safety.service \
           /etc/systemd/system/ufw-antiscan-safety.timer.antiscan-new \

@@ -8,6 +8,7 @@
 #   unload   Remove the chain and the sets
 #   disable  Turn blocking off and remove its units and configuration
 #   status   Short report
+#   config   Print the effective settings (current config or defaults)
 set -Eeuo pipefail
 # Command substitutions must fail too (fetch_lists runs inside one).
 shopt -s inherit_errexit
@@ -29,6 +30,15 @@ RKN_MAXELEM=262144
 RKN_WORK=""
 
 [[ $EUID == 0 ]] || { echo 'Нужен root.' >&2; exit 1; }
+
+# read_conf reuses the RKN_* names, so remember what the caller passed in.
+# ${VAR+x} keeps "set but empty" distinct from "unset" (needed for WHITELIST).
+[[ -z ${RKN_URLS+x} ]] || ENV_RKN_URLS=$RKN_URLS
+[[ -z ${RKN_WHITELIST+x} ]] || ENV_RKN_WHITELIST=$RKN_WHITELIST
+[[ -z ${WHITELIST+x} ]] || ENV_WHITELIST=$WHITELIST
+[[ -z ${SSH_PORT+x} ]] || ENV_SSH_PORT=$SSH_PORT
+[[ -z ${RKN_BLOCK_SSH+x} ]] || ENV_RKN_BLOCK_SSH=$RKN_BLOCK_SSH
+[[ -z ${RKN_INTERVAL+x} ]] || ENV_RKN_INTERVAL=$RKN_INTERVAL
 
 validate_settings() {
     python3 -I - "$RKN_URLS" "$RKN_WHITELIST" "$RKN_SSH_PORT" "$RKN_BLOCK_SSH" "$RKN_INTERVAL" <<'PY'
@@ -76,9 +86,10 @@ read_conf() {
 }
 
 # Download every source into $1 and build $1/list. Any failed or malformed
-# source aborts the update, so the previous list stays in force.
+# source aborts the update, so the previous list stays in force. $2 is the
+# list to compare against for the shrink guard; empty disables the guard.
 fetch_lists() {
-    local work=$1 url index=0
+    local work=$1 previous=${2-$RKN_CACHE} url index=0
     for url in $RKN_URLS; do
         curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --connect-timeout 10 --max-time 60 --max-filesize 16777216 --retry 2 \
@@ -86,12 +97,13 @@ fetch_lists() {
             || { err "Не удалось скачать $url; остаётся предыдущий список"; return 1; }
         index=$((index + 1))
     done
-    python3 -I - "$work" "$RKN_CACHE" "$RKN_MAXELEM" <<'PY'
+    python3 -I - "$work" "$previous" "$RKN_MAXELEM" <<'PY'
 import ipaddress
 import sys
 from pathlib import Path
 
-work, previous, maxelem = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+work, maxelem = Path(sys.argv[1]), int(sys.argv[3])
+previous = Path(sys.argv[2]) if sys.argv[2] else None
 # Wider entries are skipped: a broken or hijacked list must not cut off
 # whole providers (or the whole Internet) on every node at once.
 MIN_PREFIX = {4: 16, 6: 32}
@@ -116,7 +128,7 @@ for source in sorted(work.glob('source-*')):
         raise SystemExit(f'{source.name}: нет ни одной подсети; список отклонён')
 collapsed = {v: sorted(ipaddress.collapse_addresses(n)) for v, n in networks.items()}
 old = {4: 0, 6: 0}
-if previous.exists():
+if previous and previous.exists():
     for line in previous.read_text().splitlines():
         if line.strip():
             old[ipaddress.ip_network(line.strip()).version] += 1
@@ -298,17 +310,39 @@ EOF
         "/etc/systemd/system/$RKN_TIMER_UNIT"
 }
 
+# Explicit ENV wins, then the current config, then defaults. Re-applying
+# without arguments therefore keeps the existing whitelist and settings.
+resolve_settings() {
+    local cur_urls="" cur_whitelist="" cur_ssh_port="" cur_block_ssh="" cur_interval=""
+    if [[ -f "$RKN_CONF" ]]; then
+        read_conf
+        cur_urls=$RKN_URLS cur_whitelist=$RKN_WHITELIST cur_ssh_port=$RKN_SSH_PORT
+        cur_block_ssh=$RKN_BLOCK_SSH cur_interval=$RKN_INTERVAL
+    fi
+    RKN_URLS=${ENV_RKN_URLS:-${cur_urls:-$RKN_DEFAULT_URLS}}
+    # Set-but-empty WHITELIST clears it; unset keeps the current one.
+    RKN_WHITELIST=${ENV_RKN_WHITELIST-${ENV_WHITELIST-$cur_whitelist}}
+    RKN_SSH_PORT=${ENV_SSH_PORT:-$cur_ssh_port}
+    if [[ -z "$RKN_SSH_PORT" ]]; then
+        RKN_SSH_PORT=$(ss -tlnp 2>/dev/null \
+            | awk '/sshd/{match($4,/[0-9]+$/); p=substr($4,RSTART,RLENGTH); if(p) print p}' | head -1 || true)
+    fi
+    RKN_SSH_PORT=${RKN_SSH_PORT:-22}
+    RKN_BLOCK_SSH=${ENV_RKN_BLOCK_SSH:-${cur_block_ssh:-0}}
+    RKN_INTERVAL=${ENV_RKN_INTERVAL:-${cur_interval:-6h}}
+    validate_settings
+}
+
+config() {
+    resolve_settings
+    printf 'URLS=%s\nWHITELIST=%s\nSSH_PORT=%s\nBLOCK_SSH=%s\nINTERVAL=%s\n' \
+        "$RKN_URLS" "$RKN_WHITELIST" "$RKN_SSH_PORT" "$RKN_BLOCK_SSH" "$RKN_INTERVAL"
+}
+
 apply() {
     local backup original_stage code listed project_root summary
-    RKN_URLS=${RKN_URLS:-$RKN_DEFAULT_URLS}
-    RKN_WHITELIST=${RKN_WHITELIST-${WHITELIST:-}}
-    RKN_SSH_PORT=${SSH_PORT:-$(ss -tlnp 2>/dev/null \
-        | awk '/sshd/{match($4,/[0-9]+$/); p=substr($4,RSTART,RLENGTH); if(p) print p}' | head -1 || true)}
-    RKN_SSH_PORT=${RKN_SSH_PORT:-22}
-    RKN_BLOCK_SSH=${RKN_BLOCK_SSH:-0}
-    RKN_INTERVAL=${RKN_INTERVAL:-6h}
+    resolve_settings
     SAFETY_TIMER=${SAFETY_TIMER:-180}
-    validate_settings
     [[ "$SAFETY_TIMER" =~ ^[0-9]{1,10}$ ]] && (( 10#$SAFETY_TIMER >= 60 && 10#$SAFETY_TIMER <= 3600 )) \
         || err "SAFETY_TIMER должен быть от 60 до 3600 секунд"
     SAFETY_TIMER=$((10#$SAFETY_TIMER))
@@ -329,7 +363,8 @@ apply() {
     RKN_WORK=$(mktemp -d "$STATE/rkn-apply.XXXXXXXX")
     trap 'rm -rf -- "${RKN_WORK:-}"' EXIT
     info "Скачиваю списки…"
-    summary=$(fetch_lists "$RKN_WORK")
+    # A deliberate reconfiguration may switch to a smaller list.
+    summary=$(fetch_lists "$RKN_WORK" "")
     ok "$summary"
     if listed=$(admin_listed "$RKN_WORK/list"); then
         if [[ "$RKN_BLOCK_SSH" == 1 ]]; then
@@ -411,16 +446,19 @@ disable() {
 }
 
 status() {
-    local count4 count6 drops
+    local count4 count6 drops dim='\033[2m'
+    [[ -n "$NC" ]] || dim=''
+    # Same markers as status.sh, since this output is embedded there.
     if ! [[ -f "$RKN_CONF" ]]; then
-        warn "Блокировка подсетей РКН не включена"
+        echo -e "  ${dim}–  Блокировка подсетей РКН не включена${NC}"
         return 0
     fi
     if systemctl is-active "$RKN_LOAD_UNIT" >/dev/null 2>&1 && iptables -C INPUT -j "$RKN_CHAIN" 2>/dev/null; then
         count4=$(ipset list -t "$RKN_SET4" 2>/dev/null | awk -F': ' '/Number of entries/{print $2}')
         count6=$(ipset list -t "$RKN_SET6" 2>/dev/null | awk -F': ' '/Number of entries/{print $2}')
         drops=$(iptables -nvxL "$RKN_CHAIN" 2>/dev/null | awk '/match-set/{print $1; exit}')
-        ok "Блокировка РКН активна: IPv4 ${count4:-?}, IPv6 ${count6:-?} подсетей, отброшено пакетов: ${drops:-?}"
+        echo -e "  ${GREEN}✔${NC}  Блокировка РКН активна: IPv4 ${count4:-?}, IPv6 ${count6:-?} подсетей"
+        echo "    Отброшено пакетов: ${drops:-?}"
     else
         echo -e "  ${RED}✘${NC}  Блокировка РКН настроена, но не загружена (systemctl status $RKN_LOAD_UNIT)"
     fi
@@ -439,5 +477,6 @@ case "${1:-}" in
     unload) unload ;;
     disable) disable ;;
     status) status ;;
-    *) echo "Использование: rkn.sh apply|update|load|unload|disable|status" >&2; exit 2 ;;
+    config) config ;;
+    *) echo "Использование: rkn.sh apply|update|load|unload|disable|status|config" >&2; exit 2 ;;
 esac
