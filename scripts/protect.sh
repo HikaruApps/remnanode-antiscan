@@ -754,4 +754,9 @@ ok "UFW перезагружен"
 
 # The timer stays armed until an explicit confirmation from a new connection.
 trap - ERR INT TERM HUP
+# Remember the answers for the next menu run; values were validated above.
+for key in "${EXPERIMENTAL_KEYS[@]}"; do
+    printf '%s=%s\n' "$key" "${!key}"
+done > "$EXPERIMENTAL_LAST.antiscan-new" && mv -f "$EXPERIMENTAL_LAST.antiscan-new" "$EXPERIMENTAL_LAST" \
+    || warn "Не удалось сохранить параметры для следующего запуска"
 ok "Применено, ожидается подтверждение. Бэкап: $BACKUP_DIR"

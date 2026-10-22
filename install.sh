@@ -179,10 +179,27 @@ yn() {
     [[ "${REPLY,,}" == "y" ]] && YN=1 || YN=0
 }
 
+# Previous Experimental answers become defaults; explicit ENV still wins.
+load_experimental_defaults() {
+    local key value known
+    [[ -f "$EXPERIMENTAL_LAST" ]] || return 1
+    while IFS='=' read -r key value; do
+        for known in "${EXPERIMENTAL_KEYS[@]}"; do
+            if [[ "$key" == "$known" && -z ${!key+x} ]]; then
+                printf -v "$key" '%s' "$value"
+            fi
+        done
+    done < "$EXPERIMENTAL_LAST"
+}
+
 ask_experimental_params() {
     echo ""
     echo -e "  ${BOLD}Настройка параметров защиты${NC}"
-    echo -e "  ${YELLOW}Enter — оставить значение по умолчанию${NC}"
+    if load_experimental_defaults; then
+        echo -e "  ${YELLOW}Enter — оставить значение из прошлого применения${NC}"
+    else
+        echo -e "  ${YELLOW}Enter — оставить значение по умолчанию${NC}"
+    fi
     echo ""
 
     # Авто-детект SSH
