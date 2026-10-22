@@ -17,7 +17,7 @@ off()     { echo -e "  ${DIM}–  $*${NC}"; }
 section() { echo -e "\n${BOLD}━━━ $* ━━━${NC}"; }
 
 echo ""
-echo -e "${BOLD}ufw-antiscan — статус защиты${NC}"
+echo -e "${BOLD}RemnaNode AntiScan — статус защиты${NC}"
 echo -e "$(date)"
 
 # ── UFW ───────────────────────────────────────────────────────────────────────

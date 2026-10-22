@@ -31,7 +31,7 @@ recover_ssh_connection
 
 show_help() {
     cat << 'HELP'
-ufw-antiscan — защита от сканеров и флуда поверх UFW
+RemnaNode AntiScan — защита ноды поверх UFW
 
 Использование:
   sudo bash install.sh [команда]
@@ -57,7 +57,7 @@ ENV для команды basic apply:
 
 ENV для команды protect (Experimental):
   SSH_PORT              Порт SSH (авто-детект если не задан)
-  TCP_PORTS             Сервисные TCP-порты через запятую (по умолч.: 443,2087)
+  TCP_PORTS             Сервисные TCP-порты через запятую (в меню — из UFW, иначе 443)
   UDP_PORTS             Сервисные UDP-порты через запятую (по умолч.: 443)
   WHITELIST             IP/CIDR через запятую — никогда не блокируются
   ENABLE_BAD_TCP_FLAGS  1/0 — фильтровать некорректные TCP-флаги
@@ -88,14 +88,13 @@ ENV для команды tuning apply:
   SAFETY_TIMER          Время на подтверждение (по умолч.: 180 секунд)
 
 Примеры:
-  sudo SSH_PORT=22 TCP_PORTS=443,2087 UDP_PORTS=443 \
+  sudo SSH_PORT=22 TCP_PORTS=443 UDP_PORTS=443 \
        ENABLE_BAD_TCP_FLAGS=1 ENABLE_SYN_RATE_LIMIT=1 \
        WHITELIST="1.2.3.4" bash install.sh protect
 
   sudo DRY_RUN=1 ENABLE_BAD_TCP_FLAGS=1 bash install.sh protect
-  sudo --preserve-env=SSH_CONNECTION ENABLE_BBR_CAKE=1 IPV6_MODE=keep \
-       bash install.sh tuning apply
-  sudo --preserve-env=SSH_CONNECTION bash install.sh confirm
+  sudo ENABLE_BBR_CAKE=1 IPV6_MODE=keep bash install.sh tuning apply
+  sudo bash install.sh confirm
 HELP
 }
 
@@ -135,8 +134,38 @@ ask() {
     local question="$1"
     local default="$2"
     echo -ne "  ${BOLD}${question}${NC} [${CYAN}${default}${NC}]: "
-    read -r REPLY
+    read -r REPLY || input_closed
     REPLY="${REPLY:-$default}"
+}
+
+# Ctrl+D or a closed pipe: stop instead of silently taking the default answer.
+input_closed() {
+    echo ""
+    info "Ввод закрыт — выход без изменений."
+    exit 1
+}
+
+yes_no() { [[ "$1" == 1 ]] && echo "вкл" || echo "выкл"; }
+
+# Ports UFW allows for one protocol, without SSH: "tcp" or "udp", SSH port.
+ufw_service_ports() {
+    LC_ALL=C ufw status 2>/dev/null | python3 -c '
+import re
+import sys
+
+proto, ssh = sys.argv[1:3]
+spec = re.compile(r"^(\d+(?:,\d+)*)(?:/(tcp|udp))?$")
+ports = []
+for line in sys.stdin:
+    match = re.match(r"^(.*?)\s+(ALLOW|LIMIT)(\s+(?:IN|OUT|FWD))?\s+", line)
+    if not match or (match.group(3) or "").strip() in ("OUT", "FWD"):
+        continue
+    for token in re.sub(r"\(v6\)|\bon \S+", " ", match.group(1)).split():
+        found = spec.match(token)
+        if found and found.group(2) in (None, proto):
+            ports += [p for p in found.group(1).split(",") if p != ssh and p not in ports]
+print(",".join(ports))
+' "$1" "$2" 2>/dev/null || true
 }
 
 # Да/нет: yn "Вопрос" "y" → 1 или 0 в $YN
@@ -145,7 +174,7 @@ yn() {
     local default="${2:-y}"
     local hint; [[ "$default" == "y" ]] && hint="Y/n" || hint="y/N"
     echo -ne "  ${BOLD}${question}${NC} [${CYAN}${hint}${NC}]: "
-    read -r REPLY
+    read -r REPLY || input_closed
     REPLY="${REPLY:-$default}"
     [[ "${REPLY,,}" == "y" ]] && YN=1 || YN=0
 }
@@ -166,11 +195,21 @@ ask_experimental_params() {
     ask "SSH-порт" "${SSH_PORT:-$ssh_detected}"
     PARAM_SSH_PORT="$REPLY"
 
-    ask "TCP-порты сервиса (через запятую)" "${TCP_PORTS:-443,2087}"
+    # Suggest the ports UFW already allows; fall back to 443 without rules.
+    local ufw_tcp ufw_udp
+    ufw_tcp=$(ufw_service_ports tcp "$PARAM_SSH_PORT")
+    ufw_udp=$(ufw_service_ports udp "$PARAM_SSH_PORT")
+    if [[ -z "$ufw_tcp$ufw_udp" ]]; then
+        ufw_tcp=443 ufw_udp=443
+    else
+        echo -e "  ${CYAN}Порты ниже взяты из правил UFW.${NC}"
+    fi
+    ask "TCP-порты сервиса (через запятую)" "${TCP_PORTS:-$ufw_tcp}"
     PARAM_TCP_PORTS="$REPLY"
 
-    ask "UDP-порты сервиса (через запятую)" "${UDP_PORTS-443}"
+    ask "UDP-порты сервиса (через запятую, - без UDP)" "${UDP_PORTS-$ufw_udp}"
     PARAM_UDP_PORTS="$REPLY"
+    [[ "$PARAM_UDP_PORTS" != - ]] || PARAM_UDP_PORTS=""
 
     ask "Whitelist IP/CIDR (через запятую, или оставь пустым)" "${WHITELIST:-}"
     PARAM_WHITELIST="$REPLY"
@@ -264,21 +303,27 @@ ask_experimental_params() {
     # Итоговый summary
     echo ""
     echo -e "  ┌─ ${BOLD}Итоговые параметры${NC} ─────────────────────────"
-    echo -e "  │  SSH-порт:    ${CYAN}${PARAM_SSH_PORT}${NC}"
-    echo -e "  │  TCP-порты:   ${CYAN}${PARAM_TCP_PORTS}${NC}"
-    echo -e "  │  UDP-порты:   ${CYAN}${PARAM_UDP_PORTS}${NC}"
-    echo -e "  │  Whitelist:   ${CYAN}${PARAM_WHITELIST:-не задан}${NC}"
-    echo -e "  │  Bad flags:   ${CYAN}${PARAM_BAD_TCP_FLAGS}${NC}"
-    echo -e "  │  Anti-spoof:  ${CYAN}${PARAM_ANTISPOOFING}${NC}"
-    echo -e "  │  SYN limit:   ${CYAN}${PARAM_SYN_LIMIT}${NC} (${PARAM_SYN_RATE}/s, burst ${PARAM_SYN_BURST})"
-    echo -e "  │  Connlimit:   ${CYAN}${PARAM_CONN_LIMIT_ENABLED}${NC} (${PARAM_CONN_LIMIT})"
-    echo -e "  │  SSH limit:   ${CYAN}${PARAM_SSH_LIMIT}${NC} (${PARAM_SSH_RATE}/min, burst ${PARAM_SSH_BURST})"
-    echo -e "  │  Portscan:    ${CYAN}${PARAM_PORTSCAN}${NC}"
-    echo -e "  │  ICMP limit:  ${CYAN}${PARAM_ICMP_LIMIT}${NC} (${PARAM_ICMP_RATE}/s, burst ${PARAM_ICMP_BURST})"
-    echo -e "  │  Fail2Ban:    ${CYAN}${PARAM_FAIL2BAN}${NC} (${PARAM_F2B_MAXRETRY}/${PARAM_F2B_FINDTIME}s/${PARAM_F2B_BANTIME}s)"
-    echo -e "  │  CrowdSec:    ${CYAN}${PARAM_CROWDSEC}${NC}"
-    echo -e "  │  Safety:      ${CYAN}${PARAM_SAFETY_TIMER}s${NC}"
-    echo -e "  │  DRY RUN:     ${CYAN}${PARAM_DRY_RUN}${NC}"
+    # Labels carry their own padding: printf widths count bytes, not Cyrillic letters.
+    summary_row() { echo -e "  │  $1 ${CYAN}$2${NC}${3:+ ($3)}"; }
+    # Feature row: parameters are shown only when the feature is enabled.
+    feature_row() { summary_row "$1" "$(yes_no "$2")" "$([[ "$2" == 1 ]] && echo "${3:-}")"; }
+    summary_row "SSH-порт:   " "$PARAM_SSH_PORT"
+    summary_row "TCP-порты:  " "${PARAM_TCP_PORTS:-нет}"
+    summary_row "UDP-порты:  " "${PARAM_UDP_PORTS:-нет}"
+    summary_row "Whitelist:  " "${PARAM_WHITELIST:-не задан}"
+    feature_row "Bad flags:  " "$PARAM_BAD_TCP_FLAGS"
+    feature_row "Anti-spoof: " "$PARAM_ANTISPOOFING"
+    feature_row "SYN limit:  " "$PARAM_SYN_LIMIT" "${PARAM_SYN_RATE}/с, burst ${PARAM_SYN_BURST}"
+    feature_row "Connlimit:  " "$PARAM_CONN_LIMIT_ENABLED" "${PARAM_CONN_LIMIT} соединений"
+    feature_row "SSH limit:  " "$PARAM_SSH_LIMIT" "${PARAM_SSH_RATE}/мин, burst ${PARAM_SSH_BURST}"
+    feature_row "Portscan:   " "$PARAM_PORTSCAN" \
+        "${PARAM_PORTSCAN_HITS} событий за ${PARAM_PORTSCAN_WINDOW}с, бан ${PARAM_PORTSCAN_BAN_SECONDS}с"
+    feature_row "ICMP limit: " "$PARAM_ICMP_LIMIT" "${PARAM_ICMP_RATE}/с, burst ${PARAM_ICMP_BURST}"
+    feature_row "Fail2Ban:   " "$PARAM_FAIL2BAN" \
+        "${PARAM_F2B_MAXRETRY} попыток за ${PARAM_F2B_FINDTIME}с, бан ${PARAM_F2B_BANTIME}с"
+    feature_row "CrowdSec:   " "$PARAM_CROWDSEC"
+    summary_row "Safety:     " "${PARAM_SAFETY_TIMER}с"
+    summary_row "DRY RUN:    " "$(yes_no "$PARAM_DRY_RUN")"
     echo -e "  └──────────────────────────────────────────"
     echo ""
 
@@ -318,7 +363,7 @@ run_experimental() {
 }
 
 run_basic() {
-    local default_user server_address ssh_detected key_verified=0
+    local default_user server_address ssh_detected key_verified=0 key_added=0
     default_user="${SUDO_USER:-root}"
     ssh_detected=$(ss -tlnp 2>/dev/null \
         | awk '/sshd/{match($4,/[0-9]+$/); p=substr($4,RSTART,RLENGTH); if(p) print p}' \
@@ -338,11 +383,12 @@ run_basic() {
             warn "SSH-ключ не добавлен; Basic остановлен."
             return 1
         fi
+        key_added=1
         server_address=$(awk '{print $3}' <<< "${SSH_CONNECTION:-}")
         server_address="${server_address:-адрес-сервера}"
         [[ "$server_address" != *:* ]] || server_address="[$server_address]"
         echo ""
-        warn "Молодой человек, пожалуйста, откройте ВТОРУЮ сессию строго через ключ:"
+        warn "Не закрывая эту сессию, откройте ВТОРУЮ — строго по ключу:"
         echo "  ssh -o ControlMaster=no -o ControlPath=none \\"
         echo "      -o PreferredAuthentications=publickey -o PasswordAuthentication=no \\"
         echo "      -o KbdInteractiveAuthentication=no -p ${PARAM_SSH_PORT} ${PARAM_TARGET_USER}@${server_address}"
@@ -380,9 +426,20 @@ run_basic() {
     ask "Время safety-таймера, секунд" "${SAFETY_TIMER:-180}"
     PARAM_SAFETY_TIMER="$REPLY"
     echo ""
+    echo -e "  ┌─ ${BOLD}Итоговые параметры${NC} ─────────────────────────"
+    echo -e "  │  Пользователь:   ${CYAN}${PARAM_TARGET_USER}${NC}, SSH-порт ${CYAN}${PARAM_SSH_PORT}${NC}"
+    echo -e "  │  Пароль SSH:     ${CYAN}$([[ $PARAM_DISABLE_PASSWORD == 1 ]] && echo "отключить для всех" || echo "не менять")${NC}"
+    echo -e "  │  Fail2Ban:       ${CYAN}$(yes_no "$PARAM_FAIL2BAN")${NC}"
+    echo -e "  │  CrowdSec:       ${CYAN}$(yes_no "$PARAM_CROWDSEC")${NC}"
+    echo -e "  │  Safety:         ${CYAN}${PARAM_SAFETY_TIMER}с${NC}"
+    echo -e "  └──────────────────────────────────────────"
+    echo ""
     warn "После применения потребуется ещё одна новая SSH-сессия и команда confirm."
     yn "Применить выбранные функции Basic?" "n"
-    [[ "$YN" == 1 ]] || { info "Применение отменено; уже добавленный ключ сохранён."; return 0; }
+    if [[ "$YN" != 1 ]]; then
+        info "Применение отменено.$([[ $key_added == 1 ]] && echo ' Добавленный ключ остаётся в authorized_keys.')"
+        return 0
+    fi
 
     TARGET_USER="$PARAM_TARGET_USER" SSH_PORT="$PARAM_SSH_PORT" \
     DISABLE_SSH_PASSWORD="$PARAM_DISABLE_PASSWORD" \

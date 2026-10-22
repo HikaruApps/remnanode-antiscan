@@ -30,7 +30,7 @@ cd remnanode-antiscan
 sudo --preserve-env=SSH_CONNECTION bash install.sh
 
 # Предварительный просмотр одной явно выбранной Experimental-функции.
-sudo SSH_PORT=22 TCP_PORTS=443,2087 UDP_PORTS=443 \
+sudo SSH_PORT=22 TCP_PORTS=443 UDP_PORTS=443 \
   ENABLE_BAD_TCP_FLAGS=1 DRY_RUN=1 \
   bash install.sh protect
 ```
@@ -194,7 +194,7 @@ Bash/Python, затем заменяет каталог проекта. Посл
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
 | `SSH_PORT` | автоопределение, иначе `22` | Один SSH-порт |
-| `TCP_PORTS` | `443,2087` | Сервисные TCP-порты через запятую |
+| `TCP_PORTS` | `443` (в меню — порты из UFW) | Сервисные TCP-порты через запятую |
 | `UDP_PORTS` | `443` | UDP-порты; `UDP_PORTS=""` отключает список |
 | `WHITELIST` | пусто | IP/CIDR, исключённые из собственных фильтров |
 | `ENABLE_BAD_TCP_FLAGS` | `0` | Фильтрация некорректных TCP-флагов |
