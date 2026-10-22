@@ -343,7 +343,7 @@ EOF
     [[ "$server_address" != *:* ]] || server_address="[$server_address]"
     printf '  ssh -o ControlMaster=no -o ControlPath=none -p %q %q@%q\n' \
         "$SSH_PORT" "$TARGET_USER" "$server_address"
-    printf '  Из новой сессии: sudo --preserve-env=SSH_CONNECTION bash %q confirm\n' "$project_root/install.sh"
+    printf '  Из новой сессии: sudo bash %q confirm\n' "$project_root/install.sh"
     ok "Basic применён и ожидает подтверждения. Бэкап: $backup"
 }
 

@@ -106,6 +106,10 @@ sudo bash install.sh rkn status
 sudo bash install.sh rkn disable
 ```
 
+Повторный `rkn apply` (и пункт «Перенастроить» в меню) сохраняет текущие настройки:
+явно заданные `RKN_URLS`, `WHITELIST`, `SSH_PORT`, `RKN_BLOCK_SSH`, `RKN_INTERVAL`
+заменяют их, а `WHITELIST=` (в меню — `-`) очищает whitelist.
+
 Как это устроено:
 
 - Подсети хранятся в ipset `ANTISCAN-RKN4`/`ANTISCAN-RKN6`, правила — в собственной

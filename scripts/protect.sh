@@ -747,7 +747,7 @@ ok "Устаревшие статические IP-списки удалены"
 
 mark_confirmation_boundary "$BACKUP_DIR"
 warn "Проверь новое SSH-подключение и VPN. Автооткат через ${SAFETY_TIMER} секунд."
-warn "Из НОВОГО SSH-подключения: sudo --preserve-env=SSH_CONNECTION bash install.sh confirm"
+printf '  Из НОВОГО SSH-подключения: sudo bash %q confirm\n' "$(cd "$SCRIPT_DIR/.." && pwd)/install.sh"
 
 ok "UFW перезагружен"
 [[ "$ENABLE_FAIL2BAN" == 0 ]] || ok "Fail2Ban запущен"

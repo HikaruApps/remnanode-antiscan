@@ -191,18 +191,32 @@ if command -v cscli &>/dev/null; then
         bad "CrowdSec bouncer не запущен"
     fi
 
-    DECISIONS=$(cscli decisions list -o json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin) or []))' 2>/dev/null || echo '?')
-    ok "Решений, возвращённых cscli: ${DECISIONS}"
-
-    # Топ-5 активных банов
-    TOP=$(cscli decisions list 2>/dev/null | grep "^|" | head -6 || true)
-    if [[ -n "$TOP" ]]; then
-        echo ""
-        echo -e "  ${BOLD}Последние решения:${NC}"
-        echo "$TOP" | while IFS= read -r line; do
-            echo "    $line"
-        done
+    # cscli returns alerts, each carrying its own list of decisions (bans).
+    crowdsec_bans() {
+        cscli decisions list "$@" -o json 2>/dev/null | python3 -c '
+import json
+import sys
+alerts = json.load(sys.stdin) or []
+bans = [d for a in alerts for d in (a.get("decisions") or [])]
+print(len(bans))
+for d in bans[:5]:
+    value, scenario, duration = (str(d.get(k, "?")) for k in ("value", "scenario", "duration"))
+    print(f"{value:<40} {scenario} ({duration})")
+' 2>/dev/null
+    }
+    LOCAL_BANS=$(crowdsec_bans || true)
+    if [[ -n "$LOCAL_BANS" ]]; then
+        ok "Активных локальных банов: $(head -1 <<< "$LOCAL_BANS")"
+        if [[ $(wc -l <<< "$LOCAL_BANS") -gt 1 ]]; then
+            echo -e "    ${BOLD}Последние:${NC}"
+            tail -n +2 <<< "$LOCAL_BANS" | sed 's/^/    /'
+        fi
+    else
+        warn "Не удалось получить решения CrowdSec (cscli decisions list)"
     fi
+    # Includes the community blocklist pulled from the Central API.
+    ALL_BANS=$(crowdsec_bans -a | head -1 || true)
+    [[ -z "$ALL_BANS" ]] || echo "    Всего с community blocklist: ${ALL_BANS}"
 else
     warn "CrowdSec не установлен (опционально)"
 fi

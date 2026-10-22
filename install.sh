@@ -454,23 +454,32 @@ run_rkn() {
         *) info "Неизвестное действие."; return 1 ;;
     esac
 
-    local ssh_detected
-    ssh_detected=$(ss -tlnp 2>/dev/null \
-        | awk '/sshd/{match($4,/[0-9]+$/); p=substr($4,RSTART,RLENGTH); if(p) print p}' \
-        | head -1 || true)
+    # Current settings (or defaults) so that Enter keeps what is configured.
+    local key value cur_urls="" cur_whitelist="" cur_ssh_port="" cur_block_ssh=0 cur_interval=""
+    while IFS='=' read -r key value; do
+        case "$key" in
+            URLS) cur_urls=$value ;;
+            WHITELIST) cur_whitelist=$value ;;
+            SSH_PORT) cur_ssh_port=$value ;;
+            BLOCK_SSH) cur_block_ssh=$value ;;
+            INTERVAL) cur_interval=$value ;;
+        esac
+    done < <(bash "$SCRIPT_DIR/scripts/rkn.sh" config 2>/dev/null || true)
     echo ""
     echo -e "  ${YELLOW}Входящие соединения из подсетей списка будут отбрасываться на всех портах.${NC}"
     echo -e "  ${YELLOW}Ответы на исходящие соединения ноды и уже открытые сессии не затрагиваются.${NC}"
+    echo -e "  ${YELLOW}Enter — оставить текущее значение.${NC}"
     echo ""
-    ask "URL списков (через пробел)" "${RKN_URLS:-https://cdn.jsdelivr.net/gh/notacircle/greatlists@main/gn.lst https://cdn.jsdelivr.net/gh/notacircle/greatlists@main/sn.lst}"
+    ask "URL списков (через пробел)" "$cur_urls"
     PARAM_RKN_URLS="$REPLY"
-    ask "Whitelist IP/CIDR (через запятую, или оставь пустым)" "${WHITELIST:-}"
+    ask "Whitelist IP/CIDR через запятую (- очистить)" "$cur_whitelist"
     PARAM_WHITELIST="$REPLY"
-    ask "SSH-порт" "${SSH_PORT:-${ssh_detected:-22}}"
+    [[ "$PARAM_WHITELIST" != - ]] || PARAM_WHITELIST=""
+    ask "SSH-порт" "${cur_ssh_port:-22}"
     PARAM_SSH_PORT="$REPLY"
-    yn "Блокировать подсети и на SSH-порту? (риск потерять доступ)" "n"
+    yn "Блокировать подсети и на SSH-порту? (риск потерять доступ)" "$([[ $cur_block_ssh == 1 ]] && echo y || echo n)"
     PARAM_RKN_BLOCK_SSH="$YN"
-    ask "Период обновления (30min / 6h / 1d)" "${RKN_INTERVAL:-6h}"
+    ask "Период обновления (30min / 6h / 1d)" "${cur_interval:-6h}"
     PARAM_RKN_INTERVAL="$REPLY"
     ask "Время safety-таймера, секунд" "${SAFETY_TIMER:-180}"
     PARAM_SAFETY_TIMER="$REPLY"
