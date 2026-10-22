@@ -11,9 +11,9 @@
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 if [[ ! -t 1 || -n ${NO_COLOR:-} ]]; then
-    RED='' GREEN='' YELLOW='' CYAN='' BOLD='' NC=''
+    RED='' GREEN='' YELLOW='' CYAN='' BOLD='' DIM='' NC=''
 fi
 
 err()    { echo -e "${RED}[✘]${NC} $*" >&2; exit 1; }
@@ -25,6 +25,9 @@ prompt() { echo -e "${BOLD}$*${NC}"; }
 [[ $EUID -ne 0 ]] && err "Нужен root: sudo bash $0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Paths of managed files and recover_ssh_connection (sudo may drop SSH_CONNECTION).
+source "$SCRIPT_DIR/scripts/state.sh"
+recover_ssh_connection
 
 show_help() {
     cat << 'HELP'
@@ -96,11 +99,33 @@ ENV для команды tuning apply:
 HELP
 }
 
+# "✔ name" when enabled, dimmed "– name" otherwise.
+feature_mark() {
+    if [[ "$2" == 1 ]]; then
+        printf '%b✔%b %s' "$GREEN" "$NC" "$1"
+    else
+        printf '%b– %s%b' "$DIM" "$1" "$NC"
+    fi
+}
+
 show_banner() {
+    local basic=0 experimental=0 rkn=0 bbr=0 left
     printf '\n  %bRemnaNode AntiScan%b\n' "$BOLD$CYAN" "$NC"
-    printf '  Защита ноды · UFW · Управление\n'
-    if [[ -f /var/lib/ufw-antiscan/pending ]]; then
-        printf '  %bОжидается подтверждение — автооткат включён%b\n' "$YELLOW" "$NC"
+    [[ ! -f "$SSH_DROPIN" ]] || basic=1
+    ! grep -q 'UFW-ANTISCAN START' /etc/ufw/before.rules 2>/dev/null || experimental=1
+    [[ ! -f "$RKN_CONF" ]] || rkn=1
+    [[ ! -f "$TUNING_BBR_SYSCTL" ]] || bbr=1
+    printf '  %s · %s · %s · %s\n' "$(feature_mark Basic "$basic")" \
+        "$(feature_mark Experimental "$experimental")" "$(feature_mark РКН "$rkn")" \
+        "$(feature_mark BBR "$bbr")"
+    if [[ -f "$PENDING" ]]; then
+        left=$(( $(cat "$SAFETY_DEADLINE" 2>/dev/null || echo 0) - $(date +%s) ))
+        if (( left > 0 )); then
+            printf '  %bОжидается подтверждение: автооткат через %d:%02d — пункт 6 из НОВОЙ сессии%b\n' \
+                "$YELLOW" $((left / 60)) $((left % 60)) "$NC"
+        else
+            printf '  %bОжидается подтверждение — автооткат включён%b\n' "$YELLOW" "$NC"
+        fi
     fi
     printf '\n'
 }
@@ -310,7 +335,8 @@ run_basic() {
         IFS= read -r PARAM_SSH_KEY
         if ! printf '%s\n' "$PARAM_SSH_KEY" | TARGET_USER="$PARAM_TARGET_USER" SSH_PORT="$PARAM_SSH_PORT" \
             bash "$SCRIPT_DIR/scripts/basic.sh" add-key; then
-            err "SSH-ключ не добавлен; Basic остановлен."
+            warn "SSH-ключ не добавлен; Basic остановлен."
+            return 1
         fi
         server_address=$(awk '{print $3}' <<< "${SSH_CONNECTION:-}")
         server_address="${server_address:-адрес-сервера}"

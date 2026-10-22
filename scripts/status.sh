@@ -6,11 +6,14 @@ set -euo pipefail
 export LC_ALL=C
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+DIM='\033[2m'; BOLD='\033[1m'; NC='\033[0m'
+if [[ ! -t 1 || -n ${NO_COLOR:-} ]]; then GREEN='' YELLOW='' RED='' DIM='' BOLD='' NC=''; fi
 
 ok()      { echo -e "  ${GREEN}✔${NC}  $*"; }
 warn()    { echo -e "  ${YELLOW}▲${NC}  $*"; }
 bad()     { echo -e "  ${RED}✘${NC}  $*"; }
+# Optional feature that is simply not enabled: not a problem, so no warning colour.
+off()     { echo -e "  ${DIM}–  $*${NC}"; }
 section() { echo -e "\n${BOLD}━━━ $* ━━━${NC}"; }
 
 echo ""
@@ -44,7 +47,7 @@ if grep -q "UFW-ANTISCAN START" /etc/ufw/before.rules 2>/dev/null; then
         bad "Цепочка IPv4 не загружена"
     fi
 else
-    warn "Experimental-правила не установлены"
+    off "Experimental-правила не установлены"
 fi
 
 # ── SSH Basic ─────────────────────────────────────────────────────────────────
@@ -69,7 +72,7 @@ if [[ -f "$SSH_DROPIN" ]]; then
         bad "sshd не найден"
     fi
 else
-    warn "Basic не управляет парольной аутентификацией SSH"
+    off "Basic не управляет парольной аутентификацией SSH"
 fi
 
 # ── Kernel/network tuning ────────────────────────────────────────────────────
@@ -85,7 +88,7 @@ if [[ "$TCP_CC" == bbr && "$DEFAULT_QDISC" == cake ]]; then
 elif [[ -f "$BBR_SYSCTL" ]]; then
     bad "Конфиг BBR + CAKE установлен, но эффективные значения отличаются"
 else
-    warn "BBR + CAKE не управляются AntiScan"
+    off "BBR + CAKE не включены через AntiScan"
 fi
 if command -v tc >/dev/null; then
     CAKE_ACTIVE=$(tc qdisc show 2>/dev/null | grep -c 'qdisc cake ' || true)
@@ -152,7 +155,7 @@ if iptables -S ufw-antiscan 2>/dev/null | grep -q PORTSCANNERS; then
         fi
     fi
 else
-    warn "Portscan autoban не включён"
+    off "Portscan autoban не включён"
 fi
 
 # ── fail2ban ──────────────────────────────────────────────────────────────────
@@ -172,7 +175,7 @@ if command -v fail2ban-client &>/dev/null; then
         bad "fail2ban не запущен"
     fi
 else
-    warn "Fail2Ban не установлен (опционально)"
+    off "Fail2Ban не установлен"
 fi
 
 # ── CrowdSec ──────────────────────────────────────────────────────────────────
@@ -218,7 +221,7 @@ for d in bans[:5]:
     ALL_BANS=$(crowdsec_bans -a | head -1 || true)
     [[ -z "$ALL_BANS" ]] || echo "    Всего с community blocklist: ${ALL_BANS}"
 else
-    warn "CrowdSec не установлен (опционально)"
+    off "CrowdSec не установлен"
 fi
 
 # ── Активные правила ──────────────────────────────────────────────────────────
@@ -231,7 +234,14 @@ if [[ "$PORTSCAN_ENABLED" == 1 ]]; then
     echo "  Разбанить portscan-IP:    echo -<IP> > ${RECENT_FILE}"
     echo "  Разбанить всех сканеров:  echo / > ${RECENT_FILE}"
 fi
-echo "  Разбанить SSH (Fail2Ban): fail2ban-client set sshd unbanip <IP>"
-echo "  Разбанить (CrowdSec):     cscli decisions delete --ip <IP>"
+if command -v fail2ban-client >/dev/null; then
+    echo "  Разбанить SSH (Fail2Ban): fail2ban-client set sshd unbanip <IP>"
+fi
+if command -v cscli >/dev/null; then
+    echo "  Разбанить (CrowdSec):     cscli decisions delete --ip <IP>"
+fi
+if [[ -f /etc/remnanode-antiscan/rkn.conf ]]; then
+    echo "  Обновить списки РКН:      sudo bash install.sh rkn update"
+fi
 echo "  Откат:                    sudo bash install.sh rollback"
 echo ""

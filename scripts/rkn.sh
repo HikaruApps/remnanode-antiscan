@@ -446,16 +446,19 @@ disable() {
 }
 
 status() {
-    local count4 count6 drops
+    local count4 count6 drops dim='\033[2m'
+    [[ -n "$NC" ]] || dim=''
+    # Same markers as status.sh, since this output is embedded there.
     if ! [[ -f "$RKN_CONF" ]]; then
-        warn "Блокировка подсетей РКН не включена"
+        echo -e "  ${dim}–  Блокировка подсетей РКН не включена${NC}"
         return 0
     fi
     if systemctl is-active "$RKN_LOAD_UNIT" >/dev/null 2>&1 && iptables -C INPUT -j "$RKN_CHAIN" 2>/dev/null; then
         count4=$(ipset list -t "$RKN_SET4" 2>/dev/null | awk -F': ' '/Number of entries/{print $2}')
         count6=$(ipset list -t "$RKN_SET6" 2>/dev/null | awk -F': ' '/Number of entries/{print $2}')
         drops=$(iptables -nvxL "$RKN_CHAIN" 2>/dev/null | awk '/match-set/{print $1; exit}')
-        ok "Блокировка РКН активна: IPv4 ${count4:-?}, IPv6 ${count6:-?} подсетей, отброшено пакетов: ${drops:-?}"
+        echo -e "  ${GREEN}✔${NC}  Блокировка РКН активна: IPv4 ${count4:-?}, IPv6 ${count6:-?} подсетей"
+        echo "    Отброшено пакетов: ${drops:-?}"
     else
         echo -e "  ${RED}✘${NC}  Блокировка РКН настроена, но не загружена (systemctl status $RKN_LOAD_UNIT)"
     fi
